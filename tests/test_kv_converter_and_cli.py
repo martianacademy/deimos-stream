@@ -20,14 +20,17 @@ import tempfile
 from typing import Dict
 import unittest
 
-import mlx.core as mx
 import numpy as np
 
 from deimos_stream.cli import DeimosChatSession, inspect_store, main as cli_main
-from deimos_stream.engine import DeimosPagedMoEEngine
+from deimos_stream.engine import HAS_MLX, DeimosPagedMoEEngine
 from tests.test_merkle_and_arena import build_synthetic_moe_store, find_real_olmoe_store
 
+if HAS_MLX:
+    import mlx.core as mx
 
+
+@unittest.skipUnless(HAS_MLX, "MLX Metal GPU runtime requires macOS arm64")
 class TestDeimosKVConverterAndCLI(unittest.TestCase):
     def test_1_standalone_merkle_kv_prefix_cache_across_restart(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

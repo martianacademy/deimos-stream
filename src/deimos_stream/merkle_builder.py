@@ -17,14 +17,19 @@ import json
 import mmap
 import os
 from pathlib import Path
+import shutil
 import struct
 import subprocess
 import sys
 import time
 from typing import Dict, List, Optional, Tuple
 
-import mlx.core as mx
 import numpy as np
+
+try:
+    import mlx.core as mx
+except ImportError:
+    mx = None  # type: ignore[assignment]
 
 PAGE_SIZE: int = 16384
 DEIMOS_HEADER_STRUCT = struct.Struct("<8s10I8Q32s32s32s32s32s32sI12s")
@@ -48,12 +53,14 @@ def _resolve_include_dir() -> Path:
 
 
 def _resolve_dylib_path() -> Path:
-    """Chooses `native/libdeimos_stream.dylib` when writable, else `~/.cache/deimos-stream/`."""
+    """Chooses `native/libdeimos_stream.{dylib,so}` when writable, else `~/.cache/deimos-stream/`."""
+    ext = "dylib" if sys.platform == "darwin" else "so"
+    fname = f"libdeimos_stream.{ext}"
     if os.access(NATIVE_DIR, os.W_OK):
-        return NATIVE_DIR / "libdeimos_stream.dylib"
+        return NATIVE_DIR / fname
     cache_dir = Path.home() / ".cache" / "deimos-stream"
     cache_dir.mkdir(parents=True, exist_ok=True)
-    return cache_dir / "libdeimos_stream.dylib"
+    return cache_dir / fname
 
 
 def align_up(value: int, alignment: int = PAGE_SIZE) -> int:
@@ -79,33 +86,54 @@ def compile_deimos_dylib(force: bool = False) -> Path:
     src_arena = NATIVE_DIR / "deimos_arena.mm"
     inc_dir = _resolve_include_dir()
     hdr_path = inc_dir / "deimos_stream.h"
+    sha_hdr = inc_dir / "deimos_sha256.h"
     dylib_path = _resolve_dylib_path()
 
     newest_src = max(
         src_merkle.stat().st_mtime,
         src_arena.stat().st_mtime,
         hdr_path.stat().st_mtime,
+        sha_hdr.stat().st_mtime if sha_hdr.exists() else 0.0,
     )
     if not force and dylib_path.exists() and dylib_path.stat().st_mtime >= newest_src:
         return dylib_path
 
-    cmd = [
-        "clang++",
-        "-O3",
-        "-std=c++17",
-        "-dynamiclib",
-        "-fPIC",
-        "-I",
-        str(inc_dir),
-        "-x",
-        "objective-c++",
-        "-framework",
-        "Foundation",
-        str(src_merkle),
-        str(src_arena),
-        "-o",
-        str(dylib_path),
-    ]
+    if sys.platform == "darwin":
+        cmd = [
+            "clang++",
+            "-O3",
+            "-std=c++17",
+            "-dynamiclib",
+            "-fPIC",
+            "-I",
+            str(inc_dir),
+            "-x",
+            "objective-c++",
+            "-framework",
+            "Foundation",
+            str(src_merkle),
+            str(src_arena),
+            "-o",
+            str(dylib_path),
+        ]
+    else:
+        cxx = shutil.which("clang++") or shutil.which("c++") or "g++"
+        cmd = [
+            cxx,
+            "-O3",
+            "-std=c++17",
+            "-shared",
+            "-fPIC",
+            "-pthread",
+            "-I",
+            str(inc_dir),
+            "-x",
+            "c++",
+            str(src_merkle),
+            str(src_arena),
+            "-o",
+            str(dylib_path),
+        ]
     subprocess.run(cmd, check=True)
     return dylib_path
 

@@ -18,7 +18,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from deimos_stream.engine import DeimosPagedMoEEngine
+from deimos_stream.engine import HAS_MLX, DeimosPagedMoEEngine
 from tests.test_merkle_and_arena import (
     HELDOUT_EVAL_TEXTS,
     build_synthetic_moe_store,
@@ -26,6 +26,7 @@ from tests.test_merkle_and_arena import (
 )
 
 
+@unittest.skipUnless(HAS_MLX, "MLX Metal GPU runtime requires macOS arm64")
 class TestDeimosLookaheadAndDynamicK(unittest.TestCase):
     def test_1_standalone_lookahead_exact_parity_and_dynamick_tail_skip(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

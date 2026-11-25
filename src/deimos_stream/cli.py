@@ -18,8 +18,12 @@ import sys
 import time
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
-import mlx.core as mx
-from mlx_lm.models.cache import KVCache
+try:
+    import mlx.core as mx
+    from mlx_lm.models.cache import KVCache
+except ImportError:
+    mx = None  # type: ignore[assignment]
+    KVCache = object  # type: ignore[assignment,misc]
 
 from deimos_stream.arena import DeimosMerkleBridge
 from deimos_stream.backbone import mlx_mem_mb, rss_mb

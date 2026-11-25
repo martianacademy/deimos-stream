@@ -13,8 +13,8 @@
 // ============================================================================
 
 #include "deimos_stream.h"
+#include "deimos_sha256.h"
 
-#include <CommonCrypto/CommonDigest.h>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -33,7 +33,7 @@ inline void sha256_pair_deimos(const uint8_t* left32, const uint8_t* right32, ui
     buf[0] = 0x01;
     std::memcpy(buf + 1, left32, 32);
     std::memcpy(buf + 33, right32, 32);
-    CC_SHA256(buf, 65, out32);
+    deimos_sha256_bytes(buf, 65, out32);
 }
 
 inline bool is_power_of_two(uint32_t x) {
@@ -145,7 +145,7 @@ int verify_single_leaf_internal(
         if (!leaf_bytes_ptr) {
             return DEIMOS_ERR_BOUNDS;
         }
-        CC_SHA256(leaf_bytes_ptr, static_cast<CC_LONG>(e.byte_length), curr_hash);
+        deimos_sha256_bytes(leaf_bytes_ptr, static_cast<size_t>(e.byte_length), curr_hash);
         if (std::memcmp(curr_hash, e.sha256, 32) != 0) {
             e.flags &= ~DEIMOS_FLAG_VERIFIED;
             return DEIMOS_ERR_MERKLE_CORRUPT;

@@ -25,8 +25,12 @@ import sys
 import time
 from typing import Dict, List, Optional
 
-import mlx.core as mx
 import numpy as np
+
+try:
+    import mlx.core as mx
+except ImportError:
+    mx = None  # type: ignore[assignment]
 
 from deimos_stream.merkle_builder import (
     build_deimidx2_file,

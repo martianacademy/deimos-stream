@@ -20,11 +20,19 @@ from pathlib import Path
 import time
 from typing import Dict, List, Optional, Sequence, Tuple, TypedDict
 
-import mlx.core as mx
-import mlx.nn as nn
-from mlx_lm.models.base import create_attention_mask
-from mlx_lm.models.cache import KVCache
 import numpy as np
+
+try:
+    import mlx.core as mx
+    import mlx.nn as nn
+    from mlx_lm.models.base import create_attention_mask
+    from mlx_lm.models.cache import KVCache
+    HAS_MLX = True
+except ImportError:
+    mx = None  # type: ignore[assignment]
+    nn = None  # type: ignore[assignment]
+    KVCache = object  # type: ignore[assignment,misc]
+    HAS_MLX = False
 
 from deimos_stream.arena import ArenaStats, DeimosMerkleBridge, PagedExpertArena
 from deimos_stream.backbone import load_backbone, mlx_mem_mb, rss_mb
@@ -37,15 +45,24 @@ except ImportError:
     Tokenizer = None  # type: ignore[assignment,misc]
 
 
-@mx.compile
-def _compiled_swiglu_split(gu_proj: mx.array) -> mx.array:
-    gate, up = mx.split(gu_proj, 2, axis=-1)
-    return nn.silu(gate) * up
+if HAS_MLX:
 
+    @mx.compile
+    def _compiled_swiglu_split(gu_proj: mx.array) -> mx.array:
+        gate, up = mx.split(gu_proj, 2, axis=-1)
+        return nn.silu(gate) * up
 
-@partial(mx.compile, shapeless=True)
-def _compiled_moe_agg(expert_out: mx.array, scores: mx.array) -> mx.array:
-    return (expert_out * scores[..., None]).sum(axis=-2)
+    @partial(mx.compile, shapeless=True)
+    def _compiled_moe_agg(expert_out: mx.array, scores: mx.array) -> mx.array:
+        return (expert_out * scores[..., None]).sum(axis=-2)
+
+else:
+
+    def _compiled_swiglu_split(gu_proj: object) -> object:
+        return gu_proj
+
+    def _compiled_moe_agg(expert_out: object, scores: object) -> object:
+        return expert_out
 
 
 def _make_compiled_router(top_k: int, norm_topk_prob: bool):

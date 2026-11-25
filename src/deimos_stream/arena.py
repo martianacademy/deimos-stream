@@ -14,8 +14,12 @@ import ctypes
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, TypedDict
 
-import mlx.core as mx
 import numpy as np
+
+try:
+    import mlx.core as mx
+except ImportError:
+    mx = None  # type: ignore[assignment]
 
 from deimos_stream.merkle_builder import (
     compile_deimos_dylib,

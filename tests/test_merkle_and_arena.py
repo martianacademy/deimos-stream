@@ -15,25 +15,29 @@ Verifies:
 
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import json
 import os
 from pathlib import Path
 import tempfile
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 import unittest
 
-import mlx.core as mx
 import numpy as np
 
-from deimos_stream.arena import DeimosMerkleBridge, DeimosMerkleIntegrityError
-from deimos_stream.converter import convert_safetensors_moe_to_deimos_q4
-from deimos_stream.engine import DeimosPagedMoEEngine
+from deimos_stream.arena import _CArenaTelemetry, DeimosMerkleBridge, DeimosMerkleIntegrityError
+from deimos_stream.converter import convert_safetensors_moe_to_deimos_q4, normalize_moe_config
+from deimos_stream.detokenizer import IncrementalStreamingDetokenizer
+from deimos_stream.engine import HAS_MLX, DeimosPagedMoEEngine
 from deimos_stream.merkle_builder import (
     PAGE_SIZE,
     build_deimidx2_file,
     compute_q4_leaf_layout,
 )
+
+if HAS_MLX:
+    import mlx.core as mx
 
 
 def find_real_olmoe_store() -> Optional[Path]:
@@ -224,6 +228,98 @@ class TestDeimosMerkleAndArena(unittest.TestCase):
             with self.assertRaises(DeimosMerkleIntegrityError):
                 DeimosMerkleBridge(tdir, enable_nocache_fd=False)
 
+    def test_1b_cpp17_arena_lookahead_dynamick_and_robinhood_kv(self) -> None:
+        """Cross-platform C++17 test of Arena LFU+LRU, Residual Lookahead, Dynamic-K & KV table."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tdir = Path(tmp)
+            L, E, V, D, I = 3, 12, 4096, 128, 64
+            layout = compute_q4_leaf_layout(D, I, group_size=64)
+            stride = layout["stride_bytes"]
+
+            rng = np.random.default_rng(2026)
+            leaves = [rng.integers(0, 256, size=(stride,), dtype=np.uint8) for _ in range(L * E)]
+            hashes = [hashlib.sha256(lf.tobytes()).digest() for lf in leaves]
+            with open(tdir / "cas_experts_q4.bin", "wb") as cf:
+                for lf in leaves:
+                    cf.write(lf.tobytes())
+            build_deimidx2_file(
+                tdir / "merkle_tree.idx", L, E, V, D, I, 4, 64, stride, layout["payload_bytes"], hashes, kv_table_slots=8
+            )
+
+            bridge = DeimosMerkleBridge(tdir, enable_nocache_fd=True)
+            slots = 4
+            ah = bridge.lib.deimos_arena_create(
+                bridge.handle, L, E, slots,
+                layout["gu_w_bytes"], layout["gu_s_bytes"], layout["dn_w_bytes"], layout["dn_s_bytes"], 1, 1
+            )
+            self.assertTrue(bool(ah))
+            pools: List[Tuple[np.ndarray, ...]] = []  # type: ignore[name-defined]
+            try:
+                for l_i in range(L):
+                    bufs = tuple(
+                        np.zeros((slots * layout[k],), dtype=np.uint8)
+                        for k in ("gu_w_bytes", "gu_s_bytes", "gu_s_bytes", "dn_w_bytes", "dn_s_bytes", "dn_s_bytes")
+                    )
+                    pools.append(bufs)
+                    bridge.lib.deimos_arena_bind_layer_ptrs(ah, l_i, *[int(b.ctypes.data) for b in bufs])
+
+                ids = np.array([[2, 5, 8, 11]], dtype=np.int32)
+                scs = np.array([[0.55, 0.30, 0.10, 0.05]], dtype=np.float32)
+                next_pred = np.array([1, 4, 7, 10], dtype=np.int32)
+                out_p = np.empty((1, 4), dtype=np.int32)
+                out_s = np.empty((1, 4), dtype=np.float32)
+                eff_k = ctypes.c_int(4)
+
+                rc = bridge.lib.deimos_arena_resolve_and_prefetch(
+                    ah, 0,
+                    ids.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+                    scs.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                    1, 4, 0.80, 2,
+                    1, next_pred.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)), 4,
+                    out_p.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+                    out_s.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                    ctypes.byref(eff_k),
+                )
+                self.assertEqual(rc, 0)
+                self.assertEqual(eff_k.value, 2)  # 0.55 + 0.30 = 0.85 >= 0.80 -> last 2 cold tail misses skipped!
+                bridge.lib.deimos_arena_wait_idle(ah)
+
+                tel = _CArenaTelemetry()
+                bridge.lib.deimos_arena_get_telemetry(ah, ctypes.byref(tel))
+                self.assertEqual(int(tel.tail_misses_skipped), 2)
+                self.assertEqual(int(tel.lookahead_staged), 4)
+
+                # Verify staged bytes in Layer 1 slot match raw leaf bytes of predicted expert!
+                self.assertEqual(
+                    bytes(pools[1][0][: layout["gu_w_bytes"]]),
+                    bytes(leaves[1 * E + 1][: layout["gu_w_bytes"]]),
+                )
+
+                # Verify Robin-Hood KV lookup + insert
+                kh = hashlib.sha256(b"blk0").digest()
+                ph = hashlib.sha256(b"root").digest()
+                self.assertFalse(bridge.kv_lookup(kh, 1.0))
+                bridge.kv_insert(kh, ph, 16, 1.0)
+                self.assertTrue(bridge.kv_lookup(kh, 2.0))
+            finally:
+                bridge.lib.deimos_arena_destroy(ah)
+                bridge.close()
+
+        # Verify pure-Python MoE config normalizer & O(1) streaming detokenizer
+        norm_cfg = normalize_moe_config(
+            {"num_hidden_layers": 8, "hidden_size": 512, "num_attention_heads": 8, "n_routed_experts": 64, "moe_intermediate_size": 256, "vocab_size": 32000}
+        )
+        self.assertEqual(norm_cfg["num_experts"], 64)
+
+        class _MockTok:
+            def decode(self, ids: List[int]) -> str:
+                return " ".join(f"w{i}" for i in ids)
+
+        detok = IncrementalStreamingDetokenizer(_MockTok(), window_size=6)
+        emitted = "".join(detok.add_token(i) for i in range(12))
+        self.assertEqual(emitted, detok.full_text())
+
+    @unittest.skipUnless(HAS_MLX, "MLX Metal GPU runtime requires macOS arm64")
     def test_2_standalone_paged_vs_pinned_bit_exact_parity(self) -> None:
         """Verifies exact `0.0` logit & token parity between 4-slot Paged and 16-slot Pinned Q4."""
         with tempfile.TemporaryDirectory() as tmp:
@@ -254,6 +350,7 @@ class TestDeimosMerkleAndArena(unittest.TestCase):
             self.assertAlmostEqual(float(np.max(np.abs(logits_paged - logits_full))), 0.0, places=5)
             self.assertEqual(m_paged["generated_ids"], m_full["generated_ids"])
 
+    @unittest.skipUnless(HAS_MLX, "MLX Metal GPU runtime requires macOS arm64")
     def test_3_real_olmoe_6_9b_parity_and_perplexity_if_present(self) -> None:
         """Runs full 6.92B OLMoE-1B-7B 8-slot vs 64-slot `0.0` parity & PPL when store exists."""
         olmoe_dir = find_real_olmoe_store()

@@ -19,12 +19,20 @@ import mmap
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-import mlx.core as mx
-import mlx.nn as nn
-from mlx_lm.models.base import scaled_dot_product_attention
-from mlx_lm.models.cache import KVCache
-from mlx_lm.models.rope_utils import initialize_rope
 import numpy as np
+
+try:
+    import mlx.core as mx
+    import mlx.nn as nn
+    from mlx_lm.models.base import scaled_dot_product_attention
+    from mlx_lm.models.cache import KVCache
+    from mlx_lm.models.rope_utils import initialize_rope
+    _NNModuleBase = nn.Module
+except ImportError:
+    mx = None  # type: ignore[assignment]
+    nn = None  # type: ignore[assignment]
+    KVCache = object  # type: ignore[assignment,misc]
+    _NNModuleBase = object  # type: ignore[assignment,misc]
 
 
 def mlx_mem_mb() -> Tuple[float, float]:
@@ -57,7 +65,7 @@ def rss_mb() -> float:
     return 0.0
 
 
-class UniversalAttention(nn.Module):
+class UniversalAttention(_NNModuleBase):  # type: ignore[misc,valid-type]
     """Fused-QKV Metal Attention supporting MHA/GQA and full, per-head, or absent QK-Norm."""
 
     def __init__(

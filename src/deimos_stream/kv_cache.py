@@ -18,8 +18,12 @@ import struct
 import time
 from typing import Dict, List, Sequence, Tuple
 
-import mlx.core as mx
-from mlx_lm.models.cache import KVCache
+try:
+    import mlx.core as mx
+    from mlx_lm.models.cache import KVCache
+except ImportError:
+    mx = None  # type: ignore[assignment]
+    KVCache = object  # type: ignore[assignment,misc]
 
 from deimos_stream.arena import DeimosMerkleBridge
 

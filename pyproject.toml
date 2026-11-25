@@ -64,6 +64,7 @@ packages = ["src/deimos_stream"]
 
 [tool.hatch.build.targets.wheel.force-include]
 "include/deimos_stream.h" = "deimos_stream/include/deimos_stream.h"
+"include/deimos_sha256.h" = "deimos_stream/include/deimos_sha256.h"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

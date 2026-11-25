@@ -8,11 +8,13 @@ on:
 
 jobs:
   test:
-    runs-on: macos-14
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v4
-      - name: Install dependencies & run native C++17 + MLX pytest suite
+      - name: Ensure C++17 compiler is available
+        run: which c++ || (sudo apt-get update && sudo apt-get install -y --no-install-recommends g++)
+      - name: Install dependencies & run C++17 + Python pytest suite
         run: |
           uv venv --python 3.12
           uv pip install -e ".[dev]"
