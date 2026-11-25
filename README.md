@@ -1,5 +1,6 @@
 # <img src="https://raw.githubusercontent.com/martianacademy/deimos-stream/main/assets/icon.png" width="42" align="top" alt="DeimosStream Icon" /> DeimosStream
 
+[![PyPI Version](https://img.shields.io/pypi/v/deimos-stream?color=EE6A3E&label=PyPI)](https://pypi.org/project/deimos-stream/)
 [![CI Tests](https://github.com/martianacademy/deimos-stream/actions/workflows/ci.yml/badge.svg)](https://github.com/martianacademy/deimos-stream/actions/workflows/ci.yml)
 [![Martian Suite: PhobosStream](https://img.shields.io/badge/Twin_Engine-PhobosStream-EE6A3E)](https://github.com/martianacademy/phobos-stream)
 [![Backend](https://img.shields.io/badge/Metal_%E2%80%A2_MLX_%E2%80%A2_C%2B%2B17-DEIMIDX2-EE6A3E)](https://github.com/martianacademy/deimos-stream)
