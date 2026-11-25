@@ -1,0 +1,39 @@
+# Python & Virtual Environments
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Compiled Native Shared Libraries & Object Files
+*.dylib
+*.so
+*.o
+*.a
+*.dSYM/
+
+# Model Checkpoints, Merkle Indices & KV Prefix Caches
+*.bin
+*.idx
+*.safetensors
+*.gguf
+*.npz
+*.pt
+*.pth
+*merkle_store*
+kv_cache_blocks/
+checkpoints/
+models/
+
+# OS & Editor Metadata
+.DS_Store
+*.swp
+.idea/
+.vscode/
