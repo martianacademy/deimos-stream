@@ -89,8 +89,13 @@ Why Sparse MoE streaming achieves `45–57 tok/s` while dense weight streaming c
 
 ## ⚡ Quick Start
 
-### 1. Install from Source (macOS Apple Silicon `arm64`)
+### 1. Install (`PyPI` or Source on macOS Apple Silicon `arm64`)
 
+```bash
+pip install deimos-stream
+```
+
+Or install from source for development:
 ```bash
 git clone https://github.com/martianacademy/deimos-stream.git
 cd deimos-stream
@@ -98,7 +103,7 @@ uv venv --python 3.12 && source .venv/bin/activate
 uv pip install -e ".[dev]"
 pytest -v
 ```
-*(Requires macOS `arm64` with Xcode Command Line Tools `clang++` for automatic `libdeimos_stream.dylib` compilation.)*
+*(Requires macOS `arm64` with Xcode Command Line Tools `clang++` for automatic `libdeimos_stream.dylib` compilation; `DEIMIDX2` inspection & Merkle verification also compile natively on Linux C++17.)*
 
 ### 2. Convert Any `.safetensors` Sparse MoE Checkpoint & Stream Chat
 
@@ -125,7 +130,32 @@ Inside interactive `deimos-stream chat`, switch VRAM budgets and routing thresho
 * `/tau <0.50..1.00>` — adjust Miss-Only Nucleus Dynamic-K (`1.00` = bit-exact Top-K)
 * `/lookahead <on|off>` — toggle C++17 cross-layer Residual Lookahead prefetch
 
-### 3. Python API (`DeimosPagedMoEEngine`)
+### 3. OpenAI-Compatible API Gateway (`deimos-stream serve`)
+
+Expose any `DEIMIDX2` Sparse MoE store as a local OpenAI `/v1/chat/completions` server (streaming SSE + JSON, compatible with the `openai` SDK, Cursor, Continue, OpenCode, and OpenWebUI):
+
+```bash
+deimos-stream serve \
+  --store-dir ./olmoe_deimos_q4 \
+  --host 127.0.0.1 \
+  --port 8080 \
+  --slots 16 \
+  --tau 0.85 \
+  --model-name olmoe-1b-7b-q4
+```
+
+```bash
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "olmoe-1b-7b-q4",
+    "stream": true,
+    "max_tokens": 128,
+    "messages": [{"role": "user", "content": "Explain Merkle trees in two sentences."}]
+  }'
+```
+
+### 4. Python API (`DeimosPagedMoEEngine`)
 
 ```python
 from pathlib import Path

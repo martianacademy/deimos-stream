@@ -32,7 +32,12 @@ def __getattr__(name: str) -> object:
         from deimos_stream import cli
 
         return getattr(cli, name)
+    if name == "create_deimos_app":
+        from deimos_stream.server import create_deimos_app
+
+        return create_deimos_app
     raise AttributeError(f"module 'deimos_stream' has no attribute {name!r}")
+
 
 __all__ = [
     "PAGE_SIZE",
@@ -51,6 +56,7 @@ __all__ = [
     "compute_q4_leaf_layout",
     "convert_fp16_cas_store_to_q4",
     "convert_safetensors_moe_to_deimos_q4",
+    "create_deimos_app",
     "inspect_store",
     "normalize_moe_config",
 ]

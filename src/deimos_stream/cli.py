@@ -4,8 +4,9 @@ DeimosStream CLI & Interactive Streaming Runner (`src/deimos_stream/cli.py`)
 ============================================================================
 Subcommands:
   - `deimos-stream convert --model-dir <safetensors_dir> --output-dir <store_dir>`
+  - `deimos-stream serve --store-dir <store_dir> --port 8080 --slots 16 --tau 0.85`
   - `deimos-stream chat --store-dir <store_dir> --slots 16 --tau 0.85`
-  - `deimos-stream bench --store-dir <store_dir> --slots 8,16,64 --tokens 64`
+  - `deimos-stream bench --store-dir <store_dir> --slots 16 --tokens 64`
   - `deimos-stream inspect --store-dir <store_dir>`
 """
 
@@ -325,7 +326,41 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p_insp.add_argument("--store-dir", type=Path, required=True)
     p_insp.add_argument("--verify-leaves", action="store_true", help="Verify all SHA-256 leaves")
 
+    p_srv = sub.add_parser("serve", help="Launch OpenAI-compatible HTTP & SSE /v1/chat/completions server")
+    p_srv.add_argument("--store-dir", type=Path, required=True, help="DEIMIDX2 Q4 store folder")
+    p_srv.add_argument("--convert-from", type=Path, default=None, help="Optional .safetensors folder to convert first")
+    p_srv.add_argument("--host", type=str, default="127.0.0.1")
+    p_srv.add_argument("--port", type=int, default=8080)
+    p_srv.add_argument("--slots", type=int, default=16, help="Q4 expert slots per layer in VRAM")
+    p_srv.add_argument("--tau", type=float, default=0.85, help="Miss-only Nucleus Dynamic-K tau")
+    p_srv.add_argument("--no-lookahead", action="store_true")
+    p_srv.add_argument("--no-kv-cache", action="store_true")
+    p_srv.add_argument("--mmap", action="store_true", help="Use OS mmap instead of F_NOCACHE pread")
+    p_srv.add_argument("--model-name", type=str, default=None, help="Model ID exposed on /v1/models")
+
     args = parser.parse_args(argv)
+
+    if args.command == "serve":
+        import uvicorn
+        from deimos_stream.server import create_deimos_app
+
+        if args.convert_from is not None and not (args.store_dir / "merkle_tree.idx").exists():
+            convert_safetensors_moe_to_deimos_q4(args.convert_from, args.store_dir)
+        app = create_deimos_app(
+            store_dir=args.store_dir,
+            slots_per_layer=args.slots,
+            miss_tail_tau=args.tau,
+            enable_lookahead=not args.no_lookahead,
+            enable_merkle_kv=not args.no_kv_cache,
+            use_nocache_pread=not args.mmap,
+            model_name=args.model_name,
+        )
+        print(
+            f"[*] Starting DeimosStream OpenAI Gateway on http://{args.host}:{args.port} "
+            f"[Store: {args.store_dir} | Slots: {args.slots} | tau: {args.tau:.2f}]"
+        )
+        uvicorn.run(app, host=args.host, port=args.port)
+        return 0
 
     if args.command == "convert":
         out = convert_safetensors_moe_to_deimos_q4(
