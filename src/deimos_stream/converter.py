@@ -26,6 +26,7 @@ import time
 from typing import Dict, List, Optional
 
 import numpy as np
+from safetensors import safe_open
 
 try:
     import mlx.core as mx
@@ -37,6 +38,7 @@ from deimos_stream.merkle_builder import (
     compile_deimos_dylib,
     compute_q4_leaf_layout,
 )
+from deimos_stream.quant_q4 import dequantize_q4_np_to_fp16, quantize_fp16_np_to_q4
 
 
 class ShardTensorLoader:
@@ -55,10 +57,10 @@ class ShardTensorLoader:
                 if not shards:
                     raise FileNotFoundError(f"No .safetensors files found in {self.model_dir}")
                 single = shards[0]
-            loaded = mx.load(str(single))
-            self.weight_map = {k: single.name for k in loaded.keys()}
+            with safe_open(str(single), framework="numpy") as sf:
+                self.weight_map = {k: single.name for k in sf.keys()}
         self._active_shard_name: Optional[str] = None
-        self._active_shard_tensors: Dict[str, mx.array] = {}
+        self._active_shard_tensors: Dict[str, object] = {}
 
     def has(self, key: str) -> bool:
         return key in self.weight_map
@@ -68,36 +70,62 @@ class ShardTensorLoader:
         return sum(p.stat().st_size for p in seen if p.exists())
 
     def get_fp16_np(self, key: str) -> np.ndarray:
-        arr = self.get_mlx(key)
-        if arr.dtype != mx.float16:
-            arr = arr.astype(mx.float16)
-        mx.eval(arr)
-        return np.asarray(arr, dtype=np.float16)
-
-    def get_mlx(self, key: str) -> mx.array:
+        if mx is not None:
+            arr = self.get_mlx(key)
+            if arr.dtype != mx.float16:
+                arr = arr.astype(mx.float16)
+            mx.eval(arr)
+            return np.asarray(arr, dtype=np.float16)
         sname = self.weight_map[key]
+        with safe_open(str(self.model_dir / sname), framework="numpy") as sf:
+            sl = sf.get_slice(key)
+            dt_str = str(sl.get_dtype())
+            if dt_str == "BF16":
+                import torch
+
+                with safe_open(str(self.model_dir / sname), framework="pt") as spt:
+                    return spt.get_tensor(key).to(torch.float16).cpu().numpy()
+            return np.asarray(sf.get_tensor(key), dtype=np.float16)
+
+    def get_raw_np(self, key: str) -> np.ndarray:
+        sname = self.weight_map[key]
+        with safe_open(str(self.model_dir / sname), framework="numpy") as sf:
+            return np.asarray(sf.get_tensor(key))
+
+    def get_mlx(self, key: "mx.array") -> "mx.array":  # type: ignore[name-defined]
+        assert mx is not None
+        sname = self.weight_map[str(key)]
         if sname != self._active_shard_name:
             self._active_shard_tensors.clear()
             mx.clear_cache()
             self._active_shard_tensors = mx.load(str(self.model_dir / sname))
             self._active_shard_name = sname
-        return self._active_shard_tensors[key]
+        return self._active_shard_tensors[str(key)]  # type: ignore[return-value]
 
     def get_dequant_or_fp16_np(
         self, prefix: str, group_size: int = 64, bits: int = 4
     ) -> np.ndarray:
         """Loads `{prefix}.weight` either directly (FP16/BF16) or dequantized if MLX-quantized."""
         if self.has(f"{prefix}.scales"):
-            w = self.get_mlx(f"{prefix}.weight")
-            s = self.get_mlx(f"{prefix}.scales").astype(mx.float16)
-            b = (
-                self.get_mlx(f"{prefix}.biases").astype(mx.float16)
+            if mx is not None:
+                w = self.get_mlx(f"{prefix}.weight")  # type: ignore[arg-type]
+                s = self.get_mlx(f"{prefix}.scales").astype(mx.float16)  # type: ignore[arg-type]
+                b = (
+                    self.get_mlx(f"{prefix}.biases").astype(mx.float16)  # type: ignore[arg-type]
+                    if self.has(f"{prefix}.biases")
+                    else None
+                )
+                deq = mx.dequantize(w, s, b, group_size=group_size, bits=bits).astype(mx.float16)
+                mx.eval(deq)
+                return np.asarray(deq, dtype=np.float16)
+            qw_np = self.get_raw_np(f"{prefix}.weight").astype(np.uint32)
+            qs_np = self.get_fp16_np(f"{prefix}.scales")
+            qb_np = (
+                self.get_fp16_np(f"{prefix}.biases")
                 if self.has(f"{prefix}.biases")
-                else None
+                else np.zeros_like(qs_np)
             )
-            deq = mx.dequantize(w, s, b, group_size=group_size, bits=bits).astype(mx.float16)
-            mx.eval(deq)
-            return np.asarray(deq, dtype=np.float16)
+            return dequantize_q4_np_to_fp16(qw_np, qs_np, qb_np, group_size=group_size)
         return self.get_fp16_np(f"{prefix}.weight")
 
 
@@ -299,23 +327,26 @@ def convert_safetensors_moe_to_deimos_q4(
             sw_pfx = f"{lp}.mlp.switch_mlp"
 
             if (
-                loader.has(f"{sw_pfx}.gate_proj.scales")
+                mx is not None
+                and loader.has(f"{sw_pfx}.gate_proj.scales")
                 and src_q_bits == 4
                 and src_q_group == group_size
             ):
-                gw = loader.get_mlx(f"{sw_pfx}.gate_proj.weight")
-                uw = loader.get_mlx(f"{sw_pfx}.up_proj.weight")
-                gs = loader.get_mlx(f"{sw_pfx}.gate_proj.scales").astype(mx.float16)
-                us = loader.get_mlx(f"{sw_pfx}.up_proj.scales").astype(mx.float16)
-                gb = loader.get_mlx(f"{sw_pfx}.gate_proj.biases").astype(mx.float16)
-                ub = loader.get_mlx(f"{sw_pfx}.up_proj.biases").astype(mx.float16)
+                gw = loader.get_mlx(f"{sw_pfx}.gate_proj.weight")  # type: ignore[arg-type]
+                uw = loader.get_mlx(f"{sw_pfx}.up_proj.weight")  # type: ignore[arg-type]
+                gs = loader.get_mlx(f"{sw_pfx}.gate_proj.scales").astype(mx.float16)  # type: ignore[arg-type]
+                us = loader.get_mlx(f"{sw_pfx}.up_proj.scales").astype(mx.float16)  # type: ignore[arg-type]
+                gb = loader.get_mlx(f"{sw_pfx}.gate_proj.biases").astype(mx.float16)  # type: ignore[arg-type]
+                ub = loader.get_mlx(f"{sw_pfx}.up_proj.biases").astype(mx.float16)  # type: ignore[arg-type]
                 gu_qw = mx.concatenate([gw, uw], axis=1)
                 gu_qs = mx.concatenate([gs, us], axis=1)
                 gu_qb = mx.concatenate([gb, ub], axis=1)
-                dn_qw = loader.get_mlx(f"{sw_pfx}.down_proj.weight")
-                dn_qs = loader.get_mlx(f"{sw_pfx}.down_proj.scales").astype(mx.float16)
-                dn_qb = loader.get_mlx(f"{sw_pfx}.down_proj.biases").astype(mx.float16)
+                dn_qw = loader.get_mlx(f"{sw_pfx}.down_proj.weight")  # type: ignore[arg-type]
+                dn_qs = loader.get_mlx(f"{sw_pfx}.down_proj.scales").astype(mx.float16)  # type: ignore[arg-type]
+                dn_qb = loader.get_mlx(f"{sw_pfx}.down_proj.biases").astype(mx.float16)  # type: ignore[arg-type]
                 mx.eval(gu_qw, gu_qs, gu_qb, dn_qw, dn_qs, dn_qb)
+                gu_qw_np, gu_qs_np, gu_qb_np = np.asarray(gu_qw), np.asarray(gu_qs), np.asarray(gu_qb)
+                dn_qw_np, dn_qs_np, dn_qb_np = np.asarray(dn_qw), np.asarray(dn_qs), np.asarray(dn_qb)
             else:
                 if loader.has(f"{sw_pfx}.gate_proj.weight"):
                     g3 = loader.get_dequant_or_fp16_np(
@@ -347,12 +378,16 @@ def convert_safetensors_moe_to_deimos_q4(
                         gu_np[e_idx, :inter_size] = gw_e
                         gu_np[e_idx, inter_size:] = uw_e
                         dn_np[e_idx] = dw_e
-                gu_qw, gu_qs, gu_qb = mx.quantize(mx.array(gu_np), group_size=group_size, bits=4)
-                dn_qw, dn_qs, dn_qb = mx.quantize(mx.array(dn_np), group_size=group_size, bits=4)
-                mx.eval(gu_qw, gu_qs, gu_qb, dn_qw, dn_qs, dn_qb)
+                if mx is not None:
+                    gu_qw, gu_qs, gu_qb = mx.quantize(mx.array(gu_np), group_size=group_size, bits=4)
+                    dn_qw, dn_qs, dn_qb = mx.quantize(mx.array(dn_np), group_size=group_size, bits=4)
+                    mx.eval(gu_qw, gu_qs, gu_qb, dn_qw, dn_qs, dn_qb)
+                    gu_qw_np, gu_qs_np, gu_qb_np = np.asarray(gu_qw), np.asarray(gu_qs), np.asarray(gu_qb)
+                    dn_qw_np, dn_qs_np, dn_qb_np = np.asarray(dn_qw), np.asarray(dn_qs), np.asarray(dn_qb)
+                else:
+                    gu_qw_np, gu_qs_np, gu_qb_np = quantize_fp16_np_to_q4(gu_np, group_size=group_size)
+                    dn_qw_np, dn_qs_np, dn_qb_np = quantize_fp16_np_to_q4(dn_np, group_size=group_size)
 
-            gu_qw_np, gu_qs_np, gu_qb_np = np.asarray(gu_qw), np.asarray(gu_qs), np.asarray(gu_qb)
-            dn_qw_np, dn_qs_np, dn_qb_np = np.asarray(dn_qw), np.asarray(dn_qs), np.asarray(dn_qb)
             for e_idx in range(num_experts):
                 raw_leaf = (
                     gu_qw_np[e_idx].tobytes()
@@ -365,7 +400,8 @@ def convert_safetensors_moe_to_deimos_q4(
                 )
                 leaf_hashes.append(hashlib.sha256(raw_leaf).digest())
                 cas_f.write(raw_leaf)
-            mx.clear_cache()
+            if mx is not None:
+                mx.clear_cache()
             sys.stdout.write(
                 f"[DeimosStream] Layer {l_idx + 1}/{num_layers} "
                 f"({(l_idx + 1) * num_experts}/{num_layers * num_experts} Q4 Merkle leaves)\n"

@@ -206,9 +206,28 @@ class DeimosPagedMoEEngine:
             self.rms_eps,
             self.rope_theta,
         )
+        self.backend_name: str = "mlx"
         self.route_fn = _make_compiled_router(self.top_k, self.norm_topk_prob)
         mx.clear_cache()
         mx.reset_peak_memory()
+
+    def make_caches(self) -> List[KVCache]:
+        return [KVCache() for _ in range(self.num_layers)]
+
+    def reset_step_memory(self) -> None:
+        mx.clear_cache()
+        mx.reset_peak_memory()
+
+    def vram_mb(self) -> Tuple[float, float]:
+        return mlx_mem_mb()
+
+    def sample_next_token(self, logits_2d: mx.array, temperature: float = 0.0) -> int:
+        if temperature <= 1e-5:
+            tok = mx.argmax(logits_2d, axis=-1)
+        else:
+            tok = mx.random.categorical(logits_2d.astype(mx.float32) / temperature)
+        mx.eval(tok)
+        return int(tok.item())
 
     def _gather_moe_q4(
         self, l_idx: int, x_flat: mx.array, phys_idx: mx.array, scores: mx.array

@@ -217,6 +217,13 @@ class DeimosMerkleBridge:
 
         L.deimos_arena_wait_idle.argtypes = [ctypes.c_void_p]
         L.deimos_arena_wait_idle.restype = None
+        L.deimos_arena_get_slot_gens.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_uint64),
+            ctypes.c_int,
+        ]
+        L.deimos_arena_get_slot_gens.restype = ctypes.c_int
         L.deimos_arena_get_telemetry.argtypes = [
             ctypes.c_void_p,
             ctypes.POINTER(_CArenaTelemetry),

@@ -2,8 +2,8 @@
 """
 DeimosStream OpenAI-Compatible FastAPI Gateway (`src/deimos_stream/server.py`)
 ==============================================================================
-Exposes thread-safe HTTP & Server-Sent Events (SSE) endpoints over `DeimosPagedMoEEngine`:
-  - `GET  /health`               — Live VRAM, RSS, Arena hit-rate & `DEIMIDX2` Merkle telemetry
+Exposes thread-safe HTTP & Server-Sent Events (SSE) endpoints across `MLX`, `CUDA`, and `CPU`:
+  - `GET  /health`               — Live backend, VRAM, RSS, Arena hit-rate & `DEIMIDX2` telemetry
   - `GET  /v1/models`            — OpenAI-compatible model listing
   - `POST /v1/chat/completions`  — Streaming (`text/event-stream`) & non-streaming completions
   - `POST /v1/deimos/config`     — Live hot-update for `slots_per_layer`, `miss_tail_tau`, `enable_lookahead`
@@ -16,156 +16,37 @@ import json
 from pathlib import Path
 import threading
 import time
-from typing import AsyncIterator, Dict, Iterator, List, Literal, Optional, Sequence, Set, Tuple, Union
+from typing import AsyncIterator, Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union
 import uuid
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
 
 from deimos_stream import __version__
-from deimos_stream.backbone import mlx_mem_mb, rss_mb
+from deimos_stream.backbone import rss_mb
 from deimos_stream.cli import inspect_store
 from deimos_stream.detokenizer import DecodeCapableTokenizer, IncrementalStreamingDetokenizer
-from deimos_stream.engine import HAS_MLX, DeimosPagedMoEEngine
-
-if HAS_MLX:
-    import mlx.core as mx
-    from mlx_lm.models.cache import KVCache
-else:
-    mx = None  # type: ignore[assignment]
-    KVCache = object  # type: ignore[assignment,misc]
-
-
-class ChatMessage(BaseModel):
-    role: Literal["system", "user", "assistant", "developer"]
-    content: str
-
-
-class ChatCompletionRequest(BaseModel):
-    model: Optional[str] = None
-    messages: List[ChatMessage] = Field(..., min_length=1)
-    max_tokens: Optional[int] = Field(default=None, ge=1, le=8192)
-    max_completion_tokens: Optional[int] = Field(default=None, ge=1, le=8192)
-    temperature: float = Field(default=0.0, ge=0.0, le=2.0)
-    stream: bool = False
-    stop: Optional[Union[str, List[str]]] = None
-    miss_tail_tau: Optional[float] = Field(default=None, ge=0.5, le=1.0)
-    enable_lookahead: Optional[bool] = None
-
-
-class DeimosConfigUpdateRequest(BaseModel):
-    slots_per_layer: Optional[int] = Field(default=None, ge=1, le=512)
-    miss_tail_tau: Optional[float] = Field(default=None, ge=0.5, le=1.0)
-    enable_lookahead: Optional[bool] = None
-
-
-class CompletionUsage(BaseModel):
-    prompt_tokens: int
-    completion_tokens: int
-    total_tokens: int
-
-
-class DeimosRequestTelemetry(BaseModel):
-    ttft_ms: float
-    decode_tok_per_s: float
-    active_vram_mb: float
-    peak_vram_mb: float
-    rss_mb: float
-    pool_vram_mb: float
-    slots_per_layer: int
-    hit_rate_pct: float
-    sync_misses: int
-    lookahead_useful_hits: int
-    tail_misses_skipped: int
-    avg_active_k: float
-    kv_skipped_tokens: int
-    xor_proofs: int
-    byte_proofs: int
-
-
-class ChatChoiceMessage(BaseModel):
-    role: str = "assistant"
-    content: str
-
-
-class ChatChoice(BaseModel):
-    index: int = 0
-    message: ChatChoiceMessage
-    finish_reason: str
-
-
-class ChatCompletionResponse(BaseModel):
-    id: str
-    object: str = "chat.completion"
-    created: int
-    model: str
-    choices: List[ChatChoice]
-    usage: CompletionUsage
-    deimos_telemetry: DeimosRequestTelemetry
-
-
-class _FallbackByteTokenizer:
-    """Deterministic fallback tokenizer used only when a synthetic test store omits `tokenizer.json`."""
-
-    def __init__(self, vocab_size: int):
-        self.vocab_size: int = max(8, int(vocab_size))
-
-    def encode_text(self, text: str) -> List[int]:
-        raw = text.encode("utf-8")
-        return [(b % (self.vocab_size - 2)) + 2 for b in raw] or [2]
-
-    def decode(self, ids: List[int]) -> str:
-        return " ".join(f"tok{int(i)}" for i in ids)
-
-
-def _format_messages(messages: Sequence[ChatMessage]) -> str:
-    parts: List[str] = []
-    for m in messages:
-        role = "system" if m.role == "developer" else m.role
-        if role == "assistant":
-            parts.append(f"<|assistant|>\n{m.content.strip()}<|endoftext|>\n")
-        else:
-            parts.append(f"<|{role}|>\n{m.content.strip()}\n")
-    parts.append("<|assistant|>\n")
-    return "".join(parts)
-
-
-def _normalize_stops(stop: Optional[Union[str, List[str]]]) -> List[str]:
-    if stop is None:
-        return []
-    if isinstance(stop, str):
-        return [stop] if stop else []
-    return [s for s in stop if s]
-
-
-def _check_stop_buffer(buf: str, stops: Sequence[str]) -> Tuple[str, str, bool]:
-    """Splits `buf` into `(safe_to_emit, holdback, matched_stop)` without leaking stop prefixes."""
-    if not stops or not buf:
-        return buf, "", False
-    earliest: Optional[int] = None
-    for s in stops:
-        idx = buf.find(s)
-        if idx != -1 and (earliest is None or idx < earliest):
-            earliest = idx
-    if earliest is not None:
-        return buf[:earliest], "", True
-
-    hold = 0
-    for s in stops:
-        max_k = min(len(buf), len(s) - 1)
-        for k in range(max_k, 0, -1):
-            if buf.endswith(s[:k]) and k > hold:
-                hold = k
-                break
-    if hold > 0:
-        return buf[:-hold], buf[-hold:], False
-    return buf, "", False
+from deimos_stream.factory import AnyDeimosEngine, create_paged_moe_engine, resolve_backend
+from deimos_stream.schemas import (
+    ChatChoice,
+    ChatChoiceMessage,
+    ChatCompletionRequest,
+    ChatCompletionResponse,
+    ChatMessage,
+    CompletionUsage,
+    DeimosConfigUpdateRequest,
+    DeimosRequestTelemetry,
+    FallbackByteTokenizer,
+    check_stop_buffer as _check_stop_buffer,
+    format_chat_messages,
+    normalize_stops,
+)
 
 
 def create_deimos_app(
     store_dir: Path,
+    backend: str = "auto",
     slots_per_layer: int = 16,
     miss_tail_tau: float = 0.85,
     enable_lookahead: bool = True,
@@ -173,18 +54,20 @@ def create_deimos_app(
     use_nocache_pread: bool = True,
     model_name: Optional[str] = None,
 ) -> FastAPI:
-    """Creates a thread-safe OpenAI-compatible FastAPI app backed by `DeimosPagedMoEEngine`."""
+    """Creates a thread-safe OpenAI-compatible FastAPI app backed by `mlx`, `cuda`, or `cpu`."""
     resolved_dir = Path(store_dir).expanduser().resolve()
     if not (resolved_dir / "merkle_tree.idx").exists():
         raise FileNotFoundError(f"merkle_tree.idx not found in {resolved_dir}")
 
     default_model_id = model_name or resolved_dir.name
     lock = threading.Lock()
-    state: Dict[str, Optional[DeimosPagedMoEEngine]] = {"engine": None}
+    state: Dict[str, Optional[AnyDeimosEngine]] = {"engine": None}
+    active_backend = resolve_backend(backend)
 
-    if HAS_MLX:
-        state["engine"] = DeimosPagedMoEEngine(
-            resolved_dir,
+    if active_backend is not None:
+        state["engine"] = create_paged_moe_engine(
+            store_dir=resolved_dir,
+            backend=active_backend,
             slots_per_layer=slots_per_layer,
             use_nocache_pread=use_nocache_pread,
             enable_lookahead=enable_lookahead,
@@ -205,7 +88,7 @@ def create_deimos_app(
 
     app = FastAPI(
         title="DeimosStream OpenAI API Gateway",
-        description="Universal Low-VRAM Sparse MoE & LLM Merkle-Paged Streaming Engine",
+        description="Universal Low-VRAM Sparse MoE & LLM Merkle-Paged Streaming Engine (MLX • CUDA • C++17)",
         version=__version__,
         lifespan=_lifespan,
     )
@@ -217,7 +100,7 @@ def create_deimos_app(
         allow_headers=["*"],
     )
 
-    def _stop_ids_for(eng: DeimosPagedMoEEngine) -> Set[int]:
+    def _stop_ids_for(eng: AnyDeimosEngine) -> Set[int]:
         if eng.tokenizer is None:
             return set()
         eos_cfg = eng.config.get("eos_token_id", 50279)
@@ -226,12 +109,12 @@ def create_deimos_app(
         return {int(eos_cfg), 0, 50278, 50279}
 
     def _encode_messages(
-        eng: DeimosPagedMoEEngine, messages: Sequence[ChatMessage]
+        eng: AnyDeimosEngine, messages: Sequence[ChatMessage]
     ) -> Tuple[List[int], DecodeCapableTokenizer]:
-        prompt_str = _format_messages(messages)
+        prompt_str = format_chat_messages(messages)
         if eng.tokenizer is not None:
             return eng.tokenizer.encode(prompt_str).ids, eng.tokenizer
-        fb = _FallbackByteTokenizer(eng.vocab_size)
+        fb = FallbackByteTokenizer(eng.vocab_size)
         return fb.encode_text(prompt_str), fb
 
     @app.get("/health")
@@ -240,12 +123,12 @@ def create_deimos_app(
             eng = state["engine"]
             if eng is None:
                 info = inspect_store(resolved_dir, verify_all_leaves=False)
-                return {"status": "inspect_only", "mlx_available": False, "store": info}
-            act_mb, peak_mb = mlx_mem_mb()
+                return {"status": "inspect_only", "backend": None, "store": info}
+            act_mb, peak_mb = eng.vram_mb()
             st = eng.arena.get_stats(nominal_top_k=eng.top_k)
             return {
                 "status": "healthy",
-                "mlx_available": True,
+                "backend": eng.backend_name,
                 "model": default_model_id,
                 "store_dir": str(eng.store_dir),
                 "model_merkle_root": str(eng.manifest["model_merkle_root"]),
@@ -280,7 +163,7 @@ def create_deimos_app(
         with lock:
             eng = state["engine"]
             if eng is None:
-                raise HTTPException(status_code=503, detail="MLX Metal runtime unavailable on host.")
+                raise HTTPException(status_code=503, detail="No MLX or PyTorch execution runtime available.")
             if (
                 req.slots_per_layer is not None
                 and req.slots_per_layer != eng.arena.slots_per_layer
@@ -289,9 +172,11 @@ def create_deimos_app(
                 tau = req.miss_tail_tau if req.miss_tail_tau is not None else eng.miss_tail_tau
                 kv = eng.enable_merkle_kv
                 nc = eng.arena.use_nocache_pread
+                b_name = eng.backend_name
                 eng.close()
-                eng = DeimosPagedMoEEngine(
-                    resolved_dir,
+                eng = create_paged_moe_engine(
+                    store_dir=resolved_dir,
+                    backend=b_name,
                     slots_per_layer=req.slots_per_layer,
                     use_nocache_pread=nc,
                     enable_lookahead=la,
@@ -306,19 +191,19 @@ def create_deimos_app(
                     eng.enable_lookahead = bool(req.enable_lookahead)
             return {
                 "status": "ok",
+                "backend": eng.backend_name,
                 "slots_per_layer": eng.arena.slots_per_layer,
                 "miss_tail_tau": eng.miss_tail_tau,
                 "enable_lookahead": eng.enable_lookahead,
             }
 
     def _generate_events(
-        req: ChatCompletionRequest, req_id: str, created_ts: int, model_id: str
+        req: ChatCompletionRequest,
     ) -> Iterator[Tuple[str, Optional[str], Optional[DeimosRequestTelemetry], int, int]]:
-        """Locked generator yielding `("delta", text, None, 0, 0)` then `("done", reason, tel, p_n, c_n)`."""
         with lock:
             eng = state["engine"]
             if eng is None:
-                raise HTTPException(status_code=503, detail="MLX Metal runtime unavailable on host.")
+                raise HTTPException(status_code=503, detail="No MLX or PyTorch execution runtime available.")
             saved_tau, saved_la = eng.miss_tail_tau, eng.enable_lookahead
             if req.miss_tail_tau is not None:
                 eng.miss_tail_tau = float(req.miss_tail_tau)
@@ -327,24 +212,17 @@ def create_deimos_app(
             try:
                 prompt_ids, tok_impl = _encode_messages(eng, req.messages)
                 max_new = int(req.max_completion_tokens or req.max_tokens or 256)
-                stops = _normalize_stops(req.stop)
+                stops = normalize_stops(req.stop)
                 stop_ids = _stop_ids_for(eng)
-                caches = [KVCache() for _ in range(eng.num_layers)]
+                caches = eng.make_caches()
                 detok = IncrementalStreamingDetokenizer(tok_impl)
 
                 eng.arena.reset_telemetry()
-                mx.clear_cache()
-                mx.reset_peak_memory()
-
-                def _sample(logits_2d: mx.array) -> mx.array:
-                    if req.temperature <= 1e-5:
-                        return mx.argmax(logits_2d, axis=-1)
-                    return mx.random.categorical(logits_2d.astype(mx.float32) / req.temperature)
+                eng.reset_step_memory()
 
                 t_pf = time.perf_counter()
-                logits, skipped = eng.prefill_prompt(prompt_ids, caches)
-                tok_mx = _sample(logits)
-                mx.eval(tok_mx)
+                logits, skipped = eng.prefill_prompt(prompt_ids, caches)  # type: ignore[arg-type]
+                tok_id = eng.sample_next_token(logits, temperature=req.temperature)  # type: ignore[arg-type]
                 ttft_ms = (time.perf_counter() - t_pf) * 1000.0
 
                 eng.arena.reset_telemetry()
@@ -354,7 +232,6 @@ def create_deimos_app(
                 t_dec = time.perf_counter()
 
                 for step in range(max_new):
-                    tok_id = int(tok_mx.item())
                     if tok_id in stop_ids:
                         finish_reason = "stop"
                         break
@@ -367,9 +244,8 @@ def create_deimos_app(
                         finish_reason = "stop"
                         break
                     if step + 1 < max_new:
-                        logits = eng.forward_logits([tok_id], caches=caches)
-                        tok_mx = _sample(logits)
-                        mx.eval(tok_mx)
+                        logits = eng.forward_logits([tok_id], caches=caches)  # type: ignore[arg-type]
+                        tok_id = eng.sample_next_token(logits, temperature=req.temperature)  # type: ignore[arg-type]
 
                 if pending_buf and finish_reason != "stop":
                     yield ("delta", pending_buf, None, 0, 0)
@@ -385,12 +261,13 @@ def create_deimos_app(
                 if eng.enable_merkle_kv and gen_ids:
                     full_seq = list(prompt_ids) + gen_ids
                     if len(full_seq) >= 17 and caches[0].offset >= 16:
-                        eng.kv_cache.save_prefix_blocks(full_seq[: caches[0].offset + 1], caches)
+                        eng.kv_cache.save_prefix_blocks(full_seq[: caches[0].offset + 1], caches)  # type: ignore[arg-type]
 
-                act_mb, peak_mb = mlx_mem_mb()
+                act_mb, peak_mb = eng.vram_mb()
                 st = eng.arena.get_stats(nominal_top_k=eng.top_k)
                 tps = round(max(1, len(gen_ids) - 1) / decode_sec, 2) if len(gen_ids) > 1 else 0.0
                 tel = DeimosRequestTelemetry(
+                    backend=eng.backend_name,
                     ttft_ms=round(ttft_ms, 2),
                     decode_tok_per_s=tps,
                     active_vram_mb=round(act_mb, 2),
@@ -417,7 +294,7 @@ def create_deimos_app(
         req: ChatCompletionRequest,
     ) -> Union[ChatCompletionResponse, StreamingResponse]:
         if state["engine"] is None:
-            raise HTTPException(status_code=503, detail="MLX Metal runtime unavailable on host.")
+            raise HTTPException(status_code=503, detail="No MLX or PyTorch execution runtime available.")
         req_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
         created_ts = int(time.time())
         model_id = req.model or default_model_id
@@ -427,7 +304,7 @@ def create_deimos_app(
             fin_reason = "stop"
             final_tel: Optional[DeimosRequestTelemetry] = None
             p_toks, c_toks = 0, 0
-            for kind, payload, tel, pn, cn in _generate_events(req, req_id, created_ts, model_id):
+            for kind, payload, tel, pn, cn in _generate_events(req):
                 if kind == "delta" and payload:
                     text_parts.append(payload)
                 elif kind == "done":
@@ -463,7 +340,7 @@ def create_deimos_app(
                 "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}],
             }
             yield f"data: {json.dumps(role_chunk)}\n\n"
-            for kind, payload, tel, pn, cn in _generate_events(req, req_id, created_ts, model_id):
+            for kind, payload, tel, pn, cn in _generate_events(req):
                 if kind == "delta" and payload:
                     c_obj = {
                         "id": req_id,

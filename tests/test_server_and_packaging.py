@@ -24,6 +24,7 @@ import numpy as np
 from deimos_stream.engine import HAS_MLX
 from deimos_stream.merkle_builder import build_deimidx2_file, compute_q4_leaf_layout
 from deimos_stream.server import _check_stop_buffer, create_deimos_app
+from deimos_stream.torch_arena import HAS_TORCH
 from tests.test_merkle_and_arena import build_synthetic_moe_store, find_real_olmoe_store
 
 
@@ -51,7 +52,7 @@ class TestDeimosServerAndPackaging(unittest.TestCase):
         self.assertEqual(hold2, "")
         self.assertTrue(hit2)
 
-        if not HAS_MLX:
+        if not HAS_MLX and not HAS_TORCH:
             with tempfile.TemporaryDirectory() as tmp:
                 tdir = Path(tmp)
                 layout = compute_q4_leaf_layout(128, 64, group_size=64)

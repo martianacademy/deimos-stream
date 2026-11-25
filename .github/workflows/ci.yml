@@ -14,8 +14,9 @@ jobs:
       - uses: astral-sh/setup-uv@v4
       - name: Ensure C++17 compiler is available
         run: which c++ || (sudo apt-get update && sudo apt-get install -y --no-install-recommends g++)
-      - name: Install dependencies & run C++17 + Python pytest suite
+      - name: Install dependencies (with PyTorch runtime) & run C++17 + PyTorch pytest suite
         run: |
           uv venv --python 3.12
+          uv pip install torch --index-url https://download.pytorch.org/whl/cpu
           uv pip install -e ".[dev]"
           uv run pytest -v

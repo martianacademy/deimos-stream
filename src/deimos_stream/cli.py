@@ -4,9 +4,9 @@ DeimosStream CLI & Interactive Streaming Runner (`src/deimos_stream/cli.py`)
 ============================================================================
 Subcommands:
   - `deimos-stream convert --model-dir <safetensors_dir> --output-dir <store_dir>`
-  - `deimos-stream serve --store-dir <store_dir> --port 8080 --slots 16 --tau 0.85`
-  - `deimos-stream chat --store-dir <store_dir> --slots 16 --tau 0.85`
-  - `deimos-stream bench --store-dir <store_dir> --slots 16 --tokens 64`
+  - `deimos-stream serve --store-dir <store_dir> --backend auto --port 8080 --slots 16`
+  - `deimos-stream chat --store-dir <store_dir> --backend auto --slots 16 --tau 0.85`
+  - `deimos-stream bench --store-dir <store_dir> --backend auto --slots 16 --tokens 64`
   - `deimos-stream inspect --store-dir <store_dir>`
 """
 
@@ -19,26 +19,20 @@ import sys
 import time
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
-try:
-    import mlx.core as mx
-    from mlx_lm.models.cache import KVCache
-except ImportError:
-    mx = None  # type: ignore[assignment]
-    KVCache = object  # type: ignore[assignment,misc]
-
 from deimos_stream.arena import DeimosMerkleBridge
-from deimos_stream.backbone import mlx_mem_mb, rss_mb
+from deimos_stream.backbone import rss_mb
 from deimos_stream.converter import convert_safetensors_moe_to_deimos_q4
 from deimos_stream.detokenizer import IncrementalStreamingDetokenizer
-from deimos_stream.engine import DeimosPagedMoEEngine
+from deimos_stream.factory import AnyDeimosEngine, create_paged_moe_engine
 
 
 class DeimosChatSession:
-    """Interactive and scripted streaming session over `DeimosPagedMoEEngine`."""
+    """Interactive and scripted streaming session across `mlx` (Mac) and `cuda`/`cpu` (PyTorch)."""
 
     def __init__(
         self,
         store_dir: Path,
+        backend: str = "auto",
         slots_per_layer: int = 16,
         miss_tail_tau: float = 0.85,
         enable_lookahead: bool = True,
@@ -47,9 +41,11 @@ class DeimosChatSession:
         temperature: float = 0.0,
     ):
         self.store_dir: Path = Path(store_dir).expanduser().resolve()
+        self.backend: str = backend
         self.temperature: float = max(0.0, float(temperature))
-        self.engine = DeimosPagedMoEEngine(
+        self.engine: AnyDeimosEngine = create_paged_moe_engine(
             self.store_dir,
+            backend=self.backend,
             slots_per_layer=slots_per_layer,
             use_nocache_pread=use_nocache_pread,
             enable_lookahead=enable_lookahead,
@@ -74,29 +70,21 @@ class DeimosChatSession:
         chunks.append(f"<|user|>\n{user_text.strip()}\n<|assistant|>\n")
         return self.engine.tokenizer.encode("".join(chunks)).ids
 
-    def _sample_token(self, logits_2d: mx.array) -> mx.array:
-        if self.temperature <= 1e-5:
-            return mx.argmax(logits_2d, axis=-1)
-        scaled = logits_2d.astype(mx.float32) / self.temperature
-        return mx.random.categorical(scaled)
-
     def stream_turn(
         self, user_prompt: str, max_new_tokens: int = 256, print_live: bool = True
     ) -> Dict[str, object]:
         if self.engine.tokenizer is None:
             raise RuntimeError("No tokenizer.json present in Merkle store.")
         prompt_ids = self.format_chat_prompt(user_prompt)
-        caches = [KVCache() for _ in range(self.engine.num_layers)]
+        caches = self.engine.make_caches()
         detok = IncrementalStreamingDetokenizer(self.engine.tokenizer)
 
         self.engine.arena.reset_telemetry()
-        mx.clear_cache()
-        mx.reset_peak_memory()
+        self.engine.reset_step_memory()
 
         t_pf = time.perf_counter()
-        logits, skipped = self.engine.prefill_prompt(prompt_ids, caches)
-        tok_mx = self._sample_token(logits)
-        mx.eval(tok_mx)
+        logits, skipped = self.engine.prefill_prompt(prompt_ids, caches)  # type: ignore[arg-type]
+        tok_id = self.engine.sample_next_token(logits, temperature=self.temperature)  # type: ignore[arg-type]
         ttft_ms = (time.perf_counter() - t_pf) * 1000.0
 
         self.engine.arena.reset_telemetry()
@@ -104,7 +92,6 @@ class DeimosChatSession:
         t_dec = time.perf_counter()
 
         for step in range(max_new_tokens):
-            tok_id = int(tok_mx.item())
             if tok_id in self.stop_ids:
                 break
             gen_ids.append(tok_id)
@@ -113,9 +100,8 @@ class DeimosChatSession:
                 sys.stdout.write(delta)
                 sys.stdout.flush()
             if step + 1 < max_new_tokens:
-                logits = self.engine.forward_logits([tok_id], caches=caches)
-                tok_mx = self._sample_token(logits)
-                mx.eval(tok_mx)
+                logits = self.engine.forward_logits([tok_id], caches=caches)  # type: ignore[arg-type]
+                tok_id = self.engine.sample_next_token(logits, temperature=self.temperature)  # type: ignore[arg-type]
 
         decode_sec = max(1e-6, time.perf_counter() - t_dec)
         self.engine.arena.wait_idle()
@@ -129,15 +115,16 @@ class DeimosChatSession:
         if self.engine.enable_merkle_kv and gen_ids:
             full_seq = list(prompt_ids) + gen_ids
             if len(full_seq) >= 17 and caches[0].offset >= 16:
-                self.engine.kv_cache.save_prefix_blocks(full_seq[: caches[0].offset + 1], caches)
+                self.engine.kv_cache.save_prefix_blocks(full_seq[: caches[0].offset + 1], caches)  # type: ignore[arg-type]
 
-        act_mb, peak_mb = mlx_mem_mb()
+        act_mb, peak_mb = self.engine.vram_mb()
         cur_rss = rss_mb()
         st = self.engine.arena.get_stats(nominal_top_k=self.engine.top_k)
         dec_count = max(1, len(gen_ids) - 1)
         tps = round(dec_count / decode_sec, 2) if len(gen_ids) > 1 else 0.0
 
         telemetry: Dict[str, object] = {
+            "backend": self.engine.backend_name,
             "text": full_reply,
             "num_prompt_tokens": len(prompt_ids),
             "kv_skipped_tokens": skipped,
@@ -164,7 +151,7 @@ class DeimosChatSession:
     def _print_telemetry(self, t: Dict[str, object]) -> None:
         print("─" * 78)
         print(
-            f"DEIMOS-STREAM PAGED-MERKLE TELEMETRY "
+            f"DEIMOS-STREAM PAGED-MERKLE TELEMETRY [{str(t['backend']).upper()}] "
             f"(Slots: {t['slots_per_layer']}/{self.engine.num_experts}/layer | "
             f"LA: {'ON' if self.engine.enable_lookahead else 'OFF'} | tau={self.engine.miss_tail_tau:.2f})"
         )
@@ -195,7 +182,7 @@ class DeimosChatSession:
 
     def run_interactive(self, max_new_tokens: int = 256) -> None:
         print(
-            f"\n[DeimosStream Ready] Store: {self.engine.store_dir} | "
+            f"\n[DeimosStream Ready | Backend: {self.engine.backend_name.upper()}] Store: {self.engine.store_dir} | "
             f"Slots/Layer: {self.engine.arena.slots_per_layer}/{self.engine.num_experts}\n"
             "Commands: /slots <8|16|32|64>, /tau <0.5..1.0>, /lookahead <on|off>, /clear, exit\n"
         )
@@ -227,9 +214,11 @@ class DeimosChatSession:
                 tau = self.engine.miss_tail_tau
                 kv = self.engine.enable_merkle_kv
                 nc = self.engine.arena.use_nocache_pread
+                b_name = self.engine.backend_name
                 self.engine.close()
-                self.engine = DeimosPagedMoEEngine(
+                self.engine = create_paged_moe_engine(
                     self.store_dir,
+                    backend=b_name,
                     slots_per_layer=new_slots,
                     use_nocache_pread=nc,
                     enable_lookahead=la,
@@ -262,7 +251,7 @@ def inspect_store(store_dir: Path, verify_all_leaves: bool = False) -> Dict[str,
                 for e_i in range(int(h.num_experts)):
                     bridge.verify_leaf(l_i, e_i, verify_bytes=True)
         st = bridge.get_stats()
-        info: Dict[str, object] = {
+        return {
             "store_dir": str(sdir),
             "magic": bytes(h.magic).decode("ascii", errors="replace"),
             "version": int(h.version),
@@ -283,7 +272,6 @@ def inspect_store(store_dir: Path, verify_all_leaves: bool = False) -> Dict[str,
             "xor_proofs_verified": st["xor_proofs_verified"],
             "byte_proofs_verified": st["byte_proofs_verified"],
         }
-        return info
     finally:
         bridge.close()
 
@@ -291,7 +279,7 @@ def inspect_store(store_dir: Path, verify_all_leaves: bool = False) -> Dict[str,
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         prog="deimos-stream",
-        description="DeimosStream — Low-VRAM Sparse MoE & LLM Merkle-Paged Streaming Engine",
+        description="DeimosStream — Low-VRAM Sparse MoE & LLM Merkle-Paged Streaming Engine (MLX • CUDA • C++17)",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -302,6 +290,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     p_chat = sub.add_parser("chat", help="Launch interactive or single-turn low-VRAM MoE chat")
     p_chat.add_argument("--store-dir", type=Path, required=True, help="DEIMIDX2 store folder")
+    p_chat.add_argument("--backend", type=str, default="auto", choices=["auto", "mlx", "cuda", "cpu"])
     p_chat.add_argument("--slots", type=int, default=16, help="Q4 expert slots per layer in VRAM")
     p_chat.add_argument("--tau", type=float, default=0.85, help="Miss-only Nucleus Dynamic-K tau")
     p_chat.add_argument("--no-lookahead", action="store_true")
@@ -313,6 +302,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     p_bench = sub.add_parser("bench", help="Benchmark VRAM, hit rate, TTFT, and decode tok/s")
     p_bench.add_argument("--store-dir", type=Path, required=True)
+    p_bench.add_argument("--backend", type=str, default="auto", choices=["auto", "mlx", "cuda", "cpu"])
     p_bench.add_argument("--slots", type=int, default=16)
     p_bench.add_argument("--tau", type=float, default=0.85)
     p_bench.add_argument("--tokens", type=int, default=32)
@@ -329,6 +319,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p_srv = sub.add_parser("serve", help="Launch OpenAI-compatible HTTP & SSE /v1/chat/completions server")
     p_srv.add_argument("--store-dir", type=Path, required=True, help="DEIMIDX2 Q4 store folder")
     p_srv.add_argument("--convert-from", type=Path, default=None, help="Optional .safetensors folder to convert first")
+    p_srv.add_argument("--backend", type=str, default="auto", choices=["auto", "mlx", "cuda", "cpu"])
     p_srv.add_argument("--host", type=str, default="127.0.0.1")
     p_srv.add_argument("--port", type=int, default=8080)
     p_srv.add_argument("--slots", type=int, default=16, help="Q4 expert slots per layer in VRAM")
@@ -339,28 +330,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p_srv.add_argument("--model-name", type=str, default=None, help="Model ID exposed on /v1/models")
 
     args = parser.parse_args(argv)
-
-    if args.command == "serve":
-        import uvicorn
-        from deimos_stream.server import create_deimos_app
-
-        if args.convert_from is not None and not (args.store_dir / "merkle_tree.idx").exists():
-            convert_safetensors_moe_to_deimos_q4(args.convert_from, args.store_dir)
-        app = create_deimos_app(
-            store_dir=args.store_dir,
-            slots_per_layer=args.slots,
-            miss_tail_tau=args.tau,
-            enable_lookahead=not args.no_lookahead,
-            enable_merkle_kv=not args.no_kv_cache,
-            use_nocache_pread=not args.mmap,
-            model_name=args.model_name,
-        )
-        print(
-            f"[*] Starting DeimosStream OpenAI Gateway on http://{args.host}:{args.port} "
-            f"[Store: {args.store_dir} | Slots: {args.slots} | tau: {args.tau:.2f}]"
-        )
-        uvicorn.run(app, host=args.host, port=args.port)
-        return 0
 
     if args.command == "convert":
         out = convert_safetensors_moe_to_deimos_q4(
@@ -375,8 +344,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 0
 
     if args.command == "bench":
-        eng = DeimosPagedMoEEngine(
+        eng = create_paged_moe_engine(
             args.store_dir,
+            backend=args.backend,
             slots_per_layer=args.slots,
             use_nocache_pread=True,
             enable_lookahead=True,
@@ -392,9 +362,33 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             eng.close()
         return 0
 
+    if args.command == "serve":
+        import uvicorn
+        from deimos_stream.server import create_deimos_app
+
+        if args.convert_from is not None and not (args.store_dir / "merkle_tree.idx").exists():
+            convert_safetensors_moe_to_deimos_q4(args.convert_from, args.store_dir)
+        app = create_deimos_app(
+            store_dir=args.store_dir,
+            backend=args.backend,
+            slots_per_layer=args.slots,
+            miss_tail_tau=args.tau,
+            enable_lookahead=not args.no_lookahead,
+            enable_merkle_kv=not args.no_kv_cache,
+            use_nocache_pread=not args.mmap,
+            model_name=args.model_name,
+        )
+        print(
+            f"[*] Starting DeimosStream OpenAI Gateway on http://{args.host}:{args.port} "
+            f"[Store: {args.store_dir} | Backend: {args.backend} | Slots: {args.slots}]"
+        )
+        uvicorn.run(app, host=args.host, port=args.port)
+        return 0
+
     if args.command == "chat":
         sess = DeimosChatSession(
             store_dir=args.store_dir,
+            backend=args.backend,
             slots_per_layer=args.slots,
             miss_tail_tau=args.tau,
             enable_lookahead=not args.no_lookahead,

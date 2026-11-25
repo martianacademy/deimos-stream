@@ -16,7 +16,9 @@ import ctypes
 import gc
 import json
 import mmap
+import os
 from pathlib import Path
+import sys
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -44,7 +46,15 @@ def mlx_mem_mb() -> Tuple[float, float]:
 
 
 def rss_mb() -> float:
-    """Returns current macOS Mach resident set size (`resident_size`) in MiB."""
+    """Returns current process resident set size (`RSS`) in MiB on macOS (Mach) and Linux (`/proc`)."""
+    if sys.platform.startswith("linux"):
+        try:
+            parts = Path("/proc/self/statm").read_text().split()
+            return (int(parts[1]) * os.sysconf("SC_PAGE_SIZE")) / (1024.0 * 1024.0)
+        except OSError:
+            return 0.0
+    if sys.platform != "darwin":
+        return 0.0
 
     class _TaskBasicInfo(ctypes.Structure):
         _fields_ = [

@@ -3,7 +3,7 @@
 [![PyPI Version](https://img.shields.io/pypi/v/deimos-stream?color=EE6A3E&label=PyPI)](https://pypi.org/project/deimos-stream/)
 [![CI Tests](https://github.com/martianacademy/deimos-stream/actions/workflows/ci.yml/badge.svg)](https://github.com/martianacademy/deimos-stream/actions/workflows/ci.yml)
 [![Martian Suite: PhobosStream](https://img.shields.io/badge/Twin_Engine-PhobosStream-EE6A3E)](https://github.com/martianacademy/phobos-stream)
-[![Backend](https://img.shields.io/badge/Metal_%E2%80%A2_MLX_%E2%80%A2_C%2B%2B17-DEIMIDX2-EE6A3E)](https://github.com/martianacademy/deimos-stream)
+[![Backend](https://img.shields.io/badge/MLX_%E2%80%A2_CUDA_%E2%80%A2_C%2B%2B17-DEIMIDX2-EE6A3E)](https://github.com/martianacademy/deimos-stream)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-brightgreen.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/martianacademy/deimos-stream/blob/main/LICENSE)
 
@@ -90,10 +90,14 @@ Why Sparse MoE streaming achieves `45–57 tok/s` while dense weight streaming c
 
 ## ⚡ Quick Start
 
-### 1. Install (`PyPI` or Source on macOS Apple Silicon `arm64`)
+### 1. Install (`PyPI` — Apple Silicon `MLX` or Linux/Cloud `CUDA`)
 
 ```bash
+# macOS Apple Silicon (uses native MLX Metal gather_qmm + zero-copy Unified Memory):
 pip install deimos-stream
+
+# Linux / Cloud NVIDIA CUDA GPUs (installs PyTorch pinned-DMA + FlashAttention SDPA backend):
+pip install "deimos-stream[cuda]"
 ```
 
 Or install from source for development:
@@ -101,10 +105,10 @@ Or install from source for development:
 git clone https://github.com/martianacademy/deimos-stream.git
 cd deimos-stream
 uv venv --python 3.12 && source .venv/bin/activate
-uv pip install -e ".[dev]"
+uv pip install -e ".[cuda,dev]"
 pytest -v
 ```
-*(Requires macOS `arm64` with Xcode Command Line Tools `clang++` for automatic `libdeimos_stream.dylib` compilation; `DEIMIDX2` inspection & Merkle verification also compile natively on Linux C++17.)*
+*(Hardware routing `--backend auto`: on Apple Silicon, DeimosStream always selects native **`mlx`** rather than `mps` for zero-copy Unified-Memory pointers and fused 4-bit `mx.gather_qmm` Metal kernels; on Linux/Windows with NVIDIA/ROCm GPUs, it selects **`cuda`** with `pin_memory=True` async PCIe stream DMA and ABA-safe `slot_gen` slot synchronization over the exact same `DEIMIDX2` Merkle store.)*
 
 ### 2. Convert Any `.safetensors` Sparse MoE Checkpoint & Stream Chat
 

@@ -44,11 +44,13 @@ struct DeimosArenaManager {
     std::vector<LayerPoolPtrs>        ptrs;
     std::vector<std::vector<int32_t>> virt_to_phys;
     std::vector<std::vector<int32_t>> phys_to_virt;
-    std::vector<std::vector<int32_t>> slot_freq;
-    std::vector<std::vector<int64_t>> slot_step;
-    std::vector<std::vector<uint8_t>> prefetched_flag;
-    std::vector<std::vector<int32_t>> free_slots;
-    int64_t                           step_clock = 0;
+    std::vector<std::vector<int32_t>>   slot_freq;
+    std::vector<std::vector<int64_t>>  slot_step;
+    std::vector<std::vector<uint64_t>> slot_gen;
+    std::vector<std::vector<uint8_t>>  prefetched_flag;
+    std::vector<std::vector<int32_t>>  free_slots;
+    int64_t                            step_clock = 0;
+    uint64_t                           gen_clock  = 0;
 
     std::thread             worker;
     std::mutex              mtx;
@@ -104,6 +106,7 @@ struct DeimosArenaManager {
         p2v[p_slot]   = e_miss;
         freqs[p_slot] = 1;
         steps[p_slot] = step_clock;
+        slot_gen[l_idx][p_slot] = ++gen_clock;
         return p_slot;
     }
 
@@ -226,6 +229,7 @@ void* deimos_arena_create(
     mgr->phys_to_virt.assign(nL, std::vector<int32_t>(nC, -1));
     mgr->slot_freq.assign(nL, std::vector<int32_t>(nC, 0));
     mgr->slot_step.assign(nL, std::vector<int64_t>(nC, 0));
+    mgr->slot_gen.assign(nL, std::vector<uint64_t>(nC, 0));
     mgr->prefetched_flag.assign(nL, std::vector<uint8_t>(nE, 0));
     mgr->free_slots.resize(nL);
     for (int l = 0; l < num_layers; ++l) {
@@ -264,6 +268,9 @@ int deimos_arena_preload_all(void* arena_handle) {
         if (rc != DEIMOS_OK) { mgr->use_nocache_pread = saved_nc; return rc; }
         mgr->virt_to_phys[l] = all_ids;
         mgr->phys_to_virt[l] = all_ids;
+        for (int s = 0; s < mgr->slots_per_layer; ++s) {
+            mgr->slot_gen[l][s] = ++mgr->gen_clock;
+        }
         mgr->free_slots[l].clear();
     }
     mgr->use_nocache_pread = saved_nc;
@@ -400,6 +407,16 @@ int deimos_arena_resolve_and_prefetch(
 
 void deimos_arena_wait_idle(void* arena_handle) {
     if (arena_handle) static_cast<DeimosArenaManager*>(arena_handle)->wait_idle();
+}
+
+int deimos_arena_get_slot_gens(void* arena_handle, int layer_idx, uint64_t* out_gens, int max_slots) {
+    if (!arena_handle || !out_gens || max_slots <= 0) return DEIMOS_ERR_INVALID_ARG;
+    auto* mgr = static_cast<DeimosArenaManager*>(arena_handle);
+    if (layer_idx < 0 || layer_idx >= mgr->num_layers) return DEIMOS_ERR_INVALID_ARG;
+    mgr->wait_idle();
+    int n = std::min(max_slots, mgr->slots_per_layer);
+    std::memcpy(out_gens, mgr->slot_gen[layer_idx].data(), static_cast<size_t>(n) * sizeof(uint64_t));
+    return DEIMOS_OK;
 }
 
 void deimos_arena_get_telemetry(void* arena_handle, DeimosArenaTelemetry* out_tel) {

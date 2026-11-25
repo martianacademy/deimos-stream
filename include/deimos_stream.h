@@ -204,6 +204,7 @@ int deimos_arena_resolve_and_prefetch(
 );
 
 void deimos_arena_wait_idle(void* arena_handle);
+int  deimos_arena_get_slot_gens(void* arena_handle, int layer_idx, uint64_t* out_gens, int max_slots);
 void deimos_arena_get_telemetry(void* arena_handle, DeimosArenaTelemetry* out_tel);
 void deimos_arena_reset_telemetry(void* arena_handle);
 
