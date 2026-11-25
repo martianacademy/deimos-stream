@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "deimos-stream"
-version = "0.2.0"
+version = "0.3.0"
 description = "Universal Low-VRAM Sparse MoE & LLM Merkle-Paged Streaming Engine (MLX • CUDA • C++17)"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -57,6 +57,8 @@ Issues = "https://github.com/martianacademy/deimos-stream/issues"
 [project.optional-dependencies]
 cuda = [
     "torch>=2.4.0",
+    "transformers>=5.0.0",
+    "huggingface-hub>=0.26.0",
 ]
 dev = [
     "pytest>=8.0.0",

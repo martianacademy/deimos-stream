@@ -94,8 +94,14 @@ class FallbackByteTokenizer:
         return " ".join(f"tok{int(i)}" for i in ids)
 
 
-def format_chat_messages(messages: Sequence[ChatMessage]) -> str:
+def format_chat_messages(messages: Sequence[ChatMessage], use_chatml: bool = False, append_empty_think: bool = False) -> str:
     parts: List[str] = []
+    if use_chatml:
+        for m in messages:
+            role = "system" if m.role == "developer" else m.role
+            parts.append(f"<|im_start|>{role}\n{m.content.strip()}<|im_end|>\n")
+        parts.append("<|im_start|>assistant\n<think>\n\n</think>\n\n" if append_empty_think else "<|im_start|>assistant\n")
+        return "".join(parts)
     for m in messages:
         role = "system" if m.role == "developer" else m.role
         if role == "assistant":

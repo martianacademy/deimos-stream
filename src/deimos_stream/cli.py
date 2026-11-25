@@ -24,6 +24,7 @@ from deimos_stream.backbone import rss_mb
 from deimos_stream.converter import convert_safetensors_moe_to_deimos_q4
 from deimos_stream.detokenizer import IncrementalStreamingDetokenizer
 from deimos_stream.factory import AnyDeimosEngine, create_paged_moe_engine
+from deimos_stream.hf_converter import convert_hf_hybrid_moe_to_deimos
 
 
 class DeimosChatSession:
@@ -57,12 +58,26 @@ class DeimosChatSession:
             self.stop_ids: Set[int] = {int(x) for x in eos_cfg}
         else:
             self.stop_ids = {int(eos_cfg), 0, 50278, 50279}
+        if self.engine.tokenizer is not None:
+            for sp_tok in ("<|im_end|>", "<|endoftext|>", "<|eot_id|>"):
+                tid = self.engine.tokenizer.token_to_id(sp_tok)
+                if tid is not None:
+                    self.stop_ids.add(int(tid))
         self.history: List[Tuple[str, str]] = []
 
     def format_chat_prompt(self, user_text: str) -> List[int]:
         if self.engine.tokenizer is None:
             raise RuntimeError("No tokenizer.json present in Merkle store.")
         chunks: List[str] = []
+        if self.engine.tokenizer.token_to_id("<|im_start|>") is not None:
+            has_think = self.engine.tokenizer.token_to_id("</think>") is not None
+            for u_prev, a_prev in self.history:
+                chunks.append(
+                    f"<|im_start|>user\n{u_prev.strip()}<|im_end|>\n<|im_start|>assistant\n{a_prev.strip()}<|im_end|>\n"
+                )
+            gen_pfx = "<|im_start|>assistant\n<think>\n\n</think>\n\n" if has_think else "<|im_start|>assistant\n"
+            chunks.append(f"<|im_start|>user\n{user_text.strip()}<|im_end|>\n{gen_pfx}")
+            return self.engine.tokenizer.encode("".join(chunks)).ids
         for u_prev, a_prev in self.history:
             chunks.append(
                 f"<|user|>\n{u_prev.strip()}\n<|assistant|>\n{a_prev.strip()}<|endoftext|>\n"
@@ -283,10 +298,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_conv = sub.add_parser("convert", help="Convert .safetensors Sparse MoE to DEIMIDX2 Q4 store")
-    p_conv.add_argument("--model-dir", type=Path, required=True, help="Source .safetensors folder")
+    p_conv = sub.add_parser("convert", help="Convert .safetensors or HF Hybrid Sparse MoE to DEIMIDX2 Q4 store")
+    p_conv.add_argument("--model-dir", type=str, required=True, help="Local .safetensors folder or HuggingFace repo_id")
     p_conv.add_argument("--output-dir", type=Path, required=True, help="Output DEIMIDX2 store")
     p_conv.add_argument("--group-size", type=int, default=64)
+    p_conv.add_argument("--hf-hybrid", action="store_true", help="Build HF Hybrid-MoE store (e.g. Qwen3.6-35B-A3B)")
+    p_conv.add_argument("--delete-shards", action="store_true", help="Delete downloaded HF shards immediately after conversion")
 
     p_chat = sub.add_parser("chat", help="Launch interactive or single-turn low-VRAM MoE chat")
     p_chat.add_argument("--store-dir", type=Path, required=True, help="DEIMIDX2 store folder")
@@ -332,9 +349,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     if args.command == "convert":
-        out = convert_safetensors_moe_to_deimos_q4(
-            args.model_dir, args.output_dir, group_size=args.group_size
-        )
+        if args.hf_hybrid or not Path(args.model_dir).expanduser().exists():
+            out = convert_hf_hybrid_moe_to_deimos(
+                args.model_dir,
+                args.output_dir,
+                group_size=args.group_size,
+                delete_downloaded_shards=args.delete_shards,
+            )
+        else:
+            out = convert_safetensors_moe_to_deimos_q4(
+                Path(args.model_dir), args.output_dir, group_size=args.group_size
+            )
         print(json.dumps({"status": "ok", "output_store_dir": str(out)}, indent=2))
         return 0
 

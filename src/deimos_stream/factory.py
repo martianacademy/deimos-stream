@@ -12,10 +12,12 @@ Routing Priority (`backend="auto"`):
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Optional, Union
 
 from deimos_stream.engine import HAS_MLX, DeimosPagedMoEEngine
+from deimos_stream.hf_streamer import DeimosHFHybridMoEEngine
 from deimos_stream.torch_arena import HAS_TORCH
 from deimos_stream.torch_engine import TorchDeimosPagedMoEEngine
 
@@ -24,7 +26,9 @@ if HAS_TORCH:
 else:
     torch = None  # type: ignore[assignment]
 
-AnyDeimosEngine = Union[DeimosPagedMoEEngine, TorchDeimosPagedMoEEngine]
+AnyDeimosEngine = Union[
+    DeimosPagedMoEEngine, TorchDeimosPagedMoEEngine, DeimosHFHybridMoEEngine
+]
 
 
 def resolve_backend(backend: str = "auto") -> Optional[str]:
@@ -65,7 +69,26 @@ def create_paged_moe_engine(
     min_k: int = 4,
     top_k: Optional[int] = None,
 ) -> AnyDeimosEngine:
-    """Instantiates `DeimosPagedMoEEngine` (`mlx`) or `TorchDeimosPagedMoEEngine` (`cuda`/`cpu`)."""
+    """Instantiates `DeimosPagedMoEEngine` (`mlx`), `TorchDeimosPagedMoEEngine`, or `DeimosHFHybridMoEEngine`."""
+    sdir = Path(store_dir).expanduser().resolve()
+    mf_path = sdir / "merkle_manifest.json"
+    if mf_path.exists():
+        mf = json.loads(mf_path.read_text())
+        if mf.get("store_kind") == "hf_hybrid_q4" or (sdir / "hf_backbone.safetensors").exists():
+            dev_str = "cuda" if (HAS_TORCH and torch.cuda.is_available() and backend != "cpu") else "cpu"
+            return DeimosHFHybridMoEEngine(
+                store_dir=sdir,
+                device_str=dev_str,
+                slots_per_layer=slots_per_layer,
+                verify_merkle_on_cold=verify_merkle_on_cold,
+                use_nocache_pread=use_nocache_pread,
+                enable_lookahead=enable_lookahead,
+                enable_merkle_kv=enable_merkle_kv,
+                miss_tail_tau=miss_tail_tau,
+                min_k=min_k,
+                top_k=top_k,
+            )
+
     resolved = resolve_backend(backend)
     if resolved == "mlx":
         return DeimosPagedMoEEngine(

@@ -104,14 +104,19 @@ def create_deimos_app(
         if eng.tokenizer is None:
             return set()
         eos_cfg = eng.config.get("eos_token_id", 50279)
-        if isinstance(eos_cfg, list):
-            return {int(x) for x in eos_cfg}
-        return {int(eos_cfg), 0, 50278, 50279}
+        sids: Set[int] = {int(x) for x in eos_cfg} if isinstance(eos_cfg, list) else {int(eos_cfg), 0, 50278, 50279}
+        for sp_tok in ("<|im_end|>", "<|endoftext|>", "<|eot_id|>"):
+            tid = eng.tokenizer.token_to_id(sp_tok)
+            if tid is not None:
+                sids.add(int(tid))
+        return sids
 
     def _encode_messages(
         eng: AnyDeimosEngine, messages: Sequence[ChatMessage]
     ) -> Tuple[List[int], DecodeCapableTokenizer]:
-        prompt_str = format_chat_messages(messages)
+        is_chatml = eng.tokenizer is not None and eng.tokenizer.token_to_id("<|im_start|>") is not None
+        has_think = is_chatml and eng.tokenizer is not None and eng.tokenizer.token_to_id("</think>") is not None
+        prompt_str = format_chat_messages(messages, use_chatml=is_chatml, append_empty_think=has_think)
         if eng.tokenizer is not None:
             return eng.tokenizer.encode(prompt_str).ids, eng.tokenizer
         fb = FallbackByteTokenizer(eng.vocab_size)

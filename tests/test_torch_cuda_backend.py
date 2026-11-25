@@ -27,8 +27,11 @@ import numpy as np
 from safetensors.numpy import save_file as st_save_np
 
 import deimos_stream.converter as conv_mod
+from deimos_stream import inspect_store
 from deimos_stream.engine import HAS_MLX, DeimosPagedMoEEngine
-from deimos_stream.factory import resolve_backend
+from deimos_stream.factory import create_paged_moe_engine, resolve_backend
+from deimos_stream.hf_converter import convert_hf_hybrid_moe_to_deimos
+from deimos_stream.hf_streamer import DeimosHFHybridMoEEngine
 from deimos_stream.server import create_deimos_app
 from deimos_stream.torch_arena import HAS_TORCH
 from deimos_stream.torch_engine import TorchDeimosPagedMoEEngine
@@ -210,6 +213,76 @@ class TestDeimosTorchCudaBackend(unittest.TestCase):
             finally:
                 e_mlx2.close()
                 e_pt2.close()
+
+    def test_4_hf_hybrid_qwen36_moe_zero_ram_meta_streamer(self) -> None:
+        """Verifies 2026 Qwen3.6 Hybrid GatedDeltaNet+GQA+MoE conversion, Merkle proofs, and 0.0 parity."""
+        from safetensors.torch import save_file as st_save_torch
+        from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (
+            Qwen3_5MoeConfig,
+            Qwen3_5MoeTextConfig,
+        )
+        from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeForCausalLM
+
+        dev = self._torch_dev()
+        with tempfile.TemporaryDirectory() as tmp:
+            src_dir = Path(tmp) / "qwen36_raw"
+            store_dir = Path(tmp) / "qwen36_deimos_q4"
+            src_dir.mkdir()
+
+            tcfg = Qwen3_5MoeTextConfig(
+                dtype="bfloat16",
+                hidden_size=128,
+                moe_intermediate_size=64,
+                shared_expert_intermediate_size=64,
+                num_hidden_layers=4,
+                full_attention_interval=4,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+                head_dim=64,
+                linear_conv_kernel_dim=4,
+                linear_key_head_dim=32,
+                linear_value_head_dim=32,
+                linear_num_key_heads=2,
+                linear_num_value_heads=4,
+                num_experts=12,
+                num_experts_per_tok=2,
+                vocab_size=256,
+                tie_word_embeddings=False,
+            )
+            m = Qwen3_5MoeForCausalLM(tcfg).to(torch.bfloat16).eval()
+            sd = {
+                ("model.language_model." + k[len("model.") :] if k.startswith("model.") else k): v.contiguous()
+                for k, v in m.state_dict().items()
+            }
+            sd["model.visual.dummy.weight"] = torch.zeros((4, 4), dtype=torch.bfloat16)
+            sd["mtp.layers.0.dummy.weight"] = torch.zeros((4, 4), dtype=torch.bfloat16)
+            st_save_torch(sd, str(src_dir / "model.safetensors"))
+            (src_dir / "config.json").write_text(
+                json.dumps(Qwen3_5MoeConfig(text_config=tcfg.to_dict()).to_dict())
+            )
+
+            convert_hf_hybrid_moe_to_deimos(str(src_dir), store_dir, group_size=64)
+            info = inspect_store(store_dir, verify_all_leaves=True)
+            self.assertEqual(info["xor_proofs_verified"], 96)
+            self.assertEqual(info["byte_proofs_verified"], 48)
+
+            eng_paged = create_paged_moe_engine(store_dir, backend=dev, slots_per_layer=4, miss_tail_tau=1.0)
+            eng_pinned = DeimosHFHybridMoEEngine(store_dir, device_str=dev, slots_per_layer=12, miss_tail_tau=1.0)
+            try:
+                self.assertIsInstance(eng_paged, DeimosHFHybridMoEEngine)
+                p_ids = [5, 19, 37, 81, 112, 149]
+                lp = eng_paged.forward_logits(p_ids).float().cpu().numpy()
+                lr = eng_pinned.forward_logits(p_ids).float().cpu().numpy()
+                self.assertAlmostEqual(float(np.max(np.abs(lp - lr))), 0.0, places=5)
+
+                m_p = eng_paged.benchmark_token_ids(p_ids, max_new_tokens=8)
+                m_r = eng_pinned.benchmark_token_ids(p_ids, max_new_tokens=8)
+                self.assertEqual(m_p["generated_ids"], m_r["generated_ids"])
+                self.assertGreater(m_p["evictions"], 0)
+                self.assertGreater(m_p["lookahead_staged"], 0)
+            finally:
+                eng_paged.close()
+                eng_pinned.close()
 
 
 if __name__ == "__main__":
