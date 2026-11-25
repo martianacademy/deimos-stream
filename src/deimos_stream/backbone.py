@@ -17,7 +17,7 @@ import gc
 import json
 import mmap
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -147,7 +147,10 @@ class UniversalAttention(_NNModuleBase):  # type: ignore[misc,valid-type]
         return out.transpose(0, 2, 1, 3).reshape(B, L, -1) @ self.o_w.T
 
 
-SharedExpertTuple = Tuple[mx.array, mx.array, mx.array, Optional[mx.array]]
+if TYPE_CHECKING:
+    SharedExpertTuple = Tuple[mx.array, mx.array, mx.array, Optional[mx.array]]
+else:
+    SharedExpertTuple = tuple
 
 
 def _open_core_views(
