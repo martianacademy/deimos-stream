@@ -18,6 +18,7 @@ from typing import Optional, Union
 
 from deimos_stream.engine import HAS_MLX, DeimosPagedMoEEngine
 from deimos_stream.hf_streamer import DeimosHFHybridMoEEngine
+from deimos_stream.mlx_hybrid import DeimosMLXHybridMoEEngine
 from deimos_stream.torch_arena import HAS_TORCH
 from deimos_stream.torch_engine import TorchDeimosPagedMoEEngine
 
@@ -27,7 +28,10 @@ else:
     torch = None  # type: ignore[assignment]
 
 AnyDeimosEngine = Union[
-    DeimosPagedMoEEngine, TorchDeimosPagedMoEEngine, DeimosHFHybridMoEEngine
+    DeimosPagedMoEEngine,
+    DeimosMLXHybridMoEEngine,
+    TorchDeimosPagedMoEEngine,
+    DeimosHFHybridMoEEngine,
 ]
 
 
@@ -75,7 +79,20 @@ def create_paged_moe_engine(
     if mf_path.exists():
         mf = json.loads(mf_path.read_text())
         if mf.get("store_kind") == "hf_hybrid_q4" or (sdir / "hf_backbone.safetensors").exists():
-            dev_str = "cuda" if (HAS_TORCH and torch.cuda.is_available() and backend != "cpu") else "cpu"
+            resolved_h = resolve_backend(backend)
+            if resolved_h == "mlx":
+                return DeimosMLXHybridMoEEngine(
+                    store_dir=sdir,
+                    slots_per_layer=slots_per_layer,
+                    verify_merkle_on_cold=verify_merkle_on_cold,
+                    use_nocache_pread=use_nocache_pread,
+                    enable_lookahead=enable_lookahead,
+                    enable_merkle_kv=enable_merkle_kv,
+                    miss_tail_tau=miss_tail_tau,
+                    min_k=min_k,
+                    top_k=top_k,
+                )
+            dev_str = "cuda" if (resolved_h == "cuda") else "cpu"
             return DeimosHFHybridMoEEngine(
                 store_dir=sdir,
                 device_str=dev_str,

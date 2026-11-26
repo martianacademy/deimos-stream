@@ -19,6 +19,7 @@ from deimos_stream.factory import create_paged_moe_engine, resolve_backend
 from deimos_stream.hf_converter import convert_hf_hybrid_moe_to_deimos
 from deimos_stream.hf_streamer import DeimosHFHybridMoEEngine
 from deimos_stream.kv_cache import MerkleKVPrefixCache
+from deimos_stream.mlx_hybrid import DeimosMLXHybridMoEEngine
 from deimos_stream.merkle_builder import (
     PAGE_SIZE,
     build_deimidx2_file,
@@ -29,7 +30,7 @@ from deimos_stream.merkle_builder import (
 from deimos_stream.torch_arena import TorchPagedExpertArena
 from deimos_stream.torch_engine import TorchDeimosPagedMoEEngine
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 
 def __getattr__(name: str) -> object:
@@ -50,6 +51,7 @@ __all__ = [
     "BenchmarkMetrics",
     "DeimosChatSession",
     "DeimosHFHybridMoEEngine",
+    "DeimosMLXHybridMoEEngine",
     "DeimosMerkleBridge",
     "DeimosMerkleIntegrityError",
     "DeimosPagedMoEEngine",
