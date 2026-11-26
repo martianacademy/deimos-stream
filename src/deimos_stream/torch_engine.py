@@ -24,10 +24,14 @@ import numpy as np
 from deimos_stream.arena import ArenaStats, DeimosMerkleBridge
 from deimos_stream.backbone import rss_mb
 from deimos_stream.engine import BenchmarkMetrics
-from deimos_stream.quant_q4 import unpack_q4_torch
 from deimos_stream.torch_arena import HAS_TORCH, TorchPagedExpertArena
 from deimos_stream.torch_backbone import load_torch_backbone, rms_norm
 from deimos_stream.torch_kv_cache import TorchKVCache, TorchMerkleKVPrefixCache
+from deimos_stream.triton_q4 import (
+    run_paged_q4_swiglu,
+    triton_int8_gemv,
+    triton_kernels_available,
+)
 
 if HAS_TORCH:
     import torch
@@ -161,31 +165,19 @@ class TorchDeimosPagedMoEEngine:
     def _gather_moe_q4(
         self, l_idx: int, x_flat: "torch.Tensor", phys_idx: "torch.Tensor", scores: "torch.Tensor"
     ) -> "torch.Tensor":
-        N, D = x_flat.shape
-        K = phys_idx.shape[1]
         flat_slots = phys_idx.reshape(-1).to(torch.long)
-
-        gu_w = unpack_q4_torch(
-            self.arena.gu_w[l_idx][flat_slots],
-            self.arena.gu_s[l_idx][flat_slots],
-            self.arena.gu_b[l_idx][flat_slots],
+        y = run_paged_q4_swiglu(
+            x_flat,
+            self.arena.gu_w[l_idx],
+            self.arena.gu_s[l_idx],
+            self.arena.gu_b[l_idx],
+            self.arena.dn_w[l_idx],
+            self.arena.dn_s[l_idx],
+            self.arena.dn_b[l_idx],
+            flat_slots,
+            scores,
             group_size=self.arena.group_size,
-            out_dtype=self.compute_dtype,
         )
-        x_rep = x_flat.unsqueeze(1).expand(N, K, D).reshape(N * K, D, 1)
-        gu_out = torch.bmm(gu_w, x_rep).squeeze(-1)
-        gate, up = gu_out.chunk(2, dim=-1)
-        act = (F.silu(gate) * up).unsqueeze(-1)
-
-        dn_w = unpack_q4_torch(
-            self.arena.dn_w[l_idx][flat_slots],
-            self.arena.dn_s[l_idx][flat_slots],
-            self.arena.dn_b[l_idx][flat_slots],
-            group_size=self.arena.group_size,
-            out_dtype=self.compute_dtype,
-        )
-        dn_out = torch.bmm(dn_w, act).squeeze(-1).view(N, K, D)
-        y = (dn_out * scores.to(self.compute_dtype).unsqueeze(-1)).sum(dim=1)
 
         sh = self.shared_mlps[l_idx]
         if sh is not None:
@@ -269,8 +261,13 @@ class TorchDeimosPagedMoEEngine:
         h_out = rms_norm(
             h if all_positions else h[:, -1:, :], self.final_norm, self.rms_eps
         )
-        lm_w = self.lm_head_i8.to(self.compute_dtype) * self.lm_head_scale
-        logits = h_out @ lm_w.T
+        if triton_kernels_available(self.device) and h_out.shape[1] <= 4:
+            logits = triton_int8_gemv(
+                h_out.reshape(-1, self.hidden_size), self.lm_head_i8, self.lm_head_scale
+            ).view(h_out.shape[0], h_out.shape[1], self.vocab_size)
+        else:
+            lm_w = self.lm_head_i8.to(self.compute_dtype) * self.lm_head_scale
+            logits = h_out @ lm_w.T
         return logits if all_positions else logits.squeeze(1)
 
     def make_caches(self) -> List[TorchKVCache]:

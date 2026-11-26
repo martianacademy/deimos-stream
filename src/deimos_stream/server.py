@@ -52,6 +52,7 @@ def create_deimos_app(
     enable_lookahead: bool = True,
     enable_merkle_kv: bool = True,
     use_nocache_pread: bool = True,
+    verify_merkle_on_cold: bool = True,
     model_name: Optional[str] = None,
 ) -> FastAPI:
     """Creates a thread-safe OpenAI-compatible FastAPI app backed by `mlx`, `cuda`, or `cpu`."""
@@ -69,6 +70,7 @@ def create_deimos_app(
             store_dir=resolved_dir,
             backend=active_backend,
             slots_per_layer=slots_per_layer,
+            verify_merkle_on_cold=verify_merkle_on_cold,
             use_nocache_pread=use_nocache_pread,
             enable_lookahead=enable_lookahead,
             enable_merkle_kv=enable_merkle_kv,

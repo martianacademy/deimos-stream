@@ -14,6 +14,7 @@ Implements fixed-VRAM 4-bit Expert Slot Pooling for discrete NVIDIA CUDA GPUs (a
 from __future__ import annotations
 
 import ctypes
+from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -33,6 +34,20 @@ try:
 except ImportError:
     torch = None  # type: ignore[assignment]
     HAS_TORCH = False
+
+
+def _available_host_ram_bytes() -> Optional[int]:
+    """Reads Linux `/proc/meminfo` `MemAvailable` to size `pin_memory=True` safely per host."""
+    p = Path("/proc/meminfo")
+    if not p.exists():
+        return None
+    try:
+        for line in p.read_text().splitlines():
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) * 1024
+    except Exception:
+        return None
+    return None
 
 
 class TorchPagedExpertArena:
@@ -101,7 +116,9 @@ class TorchPagedExpertArena:
         )
         self._layer_dma_done: List[Optional[torch.cuda.Event]] = [None] * self.num_layers
         total_pool_bytes = self.num_layers * C * self.payload_bytes
-        use_pinned_host = self.is_cuda and (total_pool_bytes <= 4_500_000_000)
+        avail_ram = _available_host_ram_bytes()
+        pin_budget = int(avail_ram * 0.45) if avail_ram is not None else 4_500_000_000
+        use_pinned_host = self.is_cuda and (total_pool_bytes <= pin_budget)
 
         for _ in range(self.num_layers):
             if self.is_cuda:

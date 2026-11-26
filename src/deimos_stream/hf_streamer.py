@@ -29,8 +29,12 @@ import numpy as np
 from deimos_stream.arena import ArenaStats, DeimosMerkleBridge
 from deimos_stream.backbone import rss_mb
 from deimos_stream.engine import BenchmarkMetrics
-from deimos_stream.quant_q4 import unpack_q4_torch
 from deimos_stream.torch_arena import HAS_TORCH, TorchPagedExpertArena
+from deimos_stream.triton_q4 import (
+    run_paged_q4_swiglu,
+    triton_int8_gemv,
+    triton_kernels_available,
+)
 
 if HAS_TORCH:
     from safetensors.torch import load_file as st_load_torch
@@ -120,6 +124,8 @@ class DeimosInt8LMHead(_NNModule):  # type: ignore[misc,valid-type]
     def forward(self, hidden_states: "torch.Tensor") -> "torch.Tensor":
         orig_shape = hidden_states.shape[:-1]
         x = hidden_states.reshape(-1, hidden_states.shape[-1]).to(self.compute_dtype)
+        if triton_kernels_available(x.device) and x.shape[0] <= 4:
+            return triton_int8_gemv(x, self.w_i8, self.scale).reshape(*orig_shape, self.vocab_size)
         out_tiles: List[torch.Tensor] = []
         for v0 in range(0, self.vocab_size, self.tile_vocab):
             v1 = min(self.vocab_size, v0 + self.tile_vocab)
@@ -147,31 +153,20 @@ class DeimosPagedHFExperts(_NNModule):  # type: ignore[misc,valid-type]
     def _run_q4_chunk(
         self, x_chunk: "torch.Tensor", phys_np: np.ndarray, sc_chunk: "torch.Tensor"
     ) -> "torch.Tensor":
-        N, D = x_chunk.shape
-        K = phys_np.shape[1]
-        dt = x_chunk.dtype
         flat_slots = torch.from_numpy(phys_np.reshape(-1)).to(device=x_chunk.device, dtype=torch.long)
-
-        gu_w = unpack_q4_torch(
-            self.arena.gu_w[self.layer_idx][flat_slots],
-            self.arena.gu_s[self.layer_idx][flat_slots],
-            self.arena.gu_b[self.layer_idx][flat_slots],
+        l_i = self.layer_idx
+        return run_paged_q4_swiglu(
+            x_chunk,
+            self.arena.gu_w[l_i],
+            self.arena.gu_s[l_i],
+            self.arena.gu_b[l_i],
+            self.arena.dn_w[l_i],
+            self.arena.dn_s[l_i],
+            self.arena.dn_b[l_i],
+            flat_slots,
+            sc_chunk,
             group_size=self.arena.group_size,
-            out_dtype=dt,
         )
-        x_rep = x_chunk.unsqueeze(1).expand(N, K, D).reshape(N * K, D, 1)
-        gate, up = torch.bmm(gu_w, x_rep).squeeze(-1).chunk(2, dim=-1)
-        act = (F.silu(gate) * up).unsqueeze(-1)
-
-        dn_w = unpack_q4_torch(
-            self.arena.dn_w[self.layer_idx][flat_slots],
-            self.arena.dn_s[self.layer_idx][flat_slots],
-            self.arena.dn_b[self.layer_idx][flat_slots],
-            group_size=self.arena.group_size,
-            out_dtype=dt,
-        )
-        dn_out = torch.bmm(dn_w, act).squeeze(-1).view(N, K, D)
-        return (dn_out * sc_chunk.to(dt).unsqueeze(-1)).sum(dim=1)
 
     def forward(
         self,

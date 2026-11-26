@@ -39,6 +39,7 @@ class DeimosChatSession:
         enable_lookahead: bool = True,
         enable_merkle_kv: bool = True,
         use_nocache_pread: bool = True,
+        verify_merkle_on_cold: bool = True,
         temperature: float = 0.0,
     ):
         self.store_dir: Path = Path(store_dir).expanduser().resolve()
@@ -48,6 +49,7 @@ class DeimosChatSession:
             self.store_dir,
             backend=self.backend,
             slots_per_layer=slots_per_layer,
+            verify_merkle_on_cold=verify_merkle_on_cold,
             use_nocache_pread=use_nocache_pread,
             enable_lookahead=enable_lookahead,
             enable_merkle_kv=enable_merkle_kv,
@@ -312,6 +314,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p_chat.add_argument("--tau", type=float, default=0.85, help="Miss-only Nucleus Dynamic-K tau")
     p_chat.add_argument("--no-lookahead", action="store_true")
     p_chat.add_argument("--no-kv-cache", action="store_true")
+    p_chat.add_argument("--no-verify", action="store_true", help="Skip cold-load SHA-256 leaf verification on trusted local SSDs")
     p_chat.add_argument("--mmap", action="store_true", help="Use OS mmap instead of F_NOCACHE pread")
     p_chat.add_argument("--temp", type=float, default=0.0)
     p_chat.add_argument("--max-tokens", type=int, default=256)
@@ -322,6 +325,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p_bench.add_argument("--backend", type=str, default="auto", choices=["auto", "mlx", "cuda", "cpu"])
     p_bench.add_argument("--slots", type=int, default=16)
     p_bench.add_argument("--tau", type=float, default=0.85)
+    p_bench.add_argument("--no-verify", action="store_true", help="Skip cold-load SHA-256 leaf verification")
     p_bench.add_argument("--tokens", type=int, default=32)
     p_bench.add_argument(
         "--prompt",
@@ -343,6 +347,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p_srv.add_argument("--tau", type=float, default=0.85, help="Miss-only Nucleus Dynamic-K tau")
     p_srv.add_argument("--no-lookahead", action="store_true")
     p_srv.add_argument("--no-kv-cache", action="store_true")
+    p_srv.add_argument("--no-verify", action="store_true", help="Skip cold-load SHA-256 leaf verification")
     p_srv.add_argument("--mmap", action="store_true", help="Use OS mmap instead of F_NOCACHE pread")
     p_srv.add_argument("--model-name", type=str, default=None, help="Model ID exposed on /v1/models")
 
@@ -373,6 +378,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             args.store_dir,
             backend=args.backend,
             slots_per_layer=args.slots,
+            verify_merkle_on_cold=not args.no_verify,
             use_nocache_pread=True,
             enable_lookahead=True,
             miss_tail_tau=args.tau,
@@ -401,6 +407,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             enable_lookahead=not args.no_lookahead,
             enable_merkle_kv=not args.no_kv_cache,
             use_nocache_pread=not args.mmap,
+            verify_merkle_on_cold=not args.no_verify,
             model_name=args.model_name,
         )
         print(
@@ -419,6 +426,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             enable_lookahead=not args.no_lookahead,
             enable_merkle_kv=not args.no_kv_cache,
             use_nocache_pread=not args.mmap,
+            verify_merkle_on_cold=not args.no_verify,
             temperature=args.temp,
         )
         try:
