@@ -13,11 +13,14 @@ Routing Priority (`backend="auto"`):
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 from typing import Optional, Union
 
 from deimos_stream.engine import HAS_MLX, DeimosPagedMoEEngine
+from deimos_stream.fast_decode import apply_q4_backbone
 from deimos_stream.hf_streamer import DeimosHFHybridMoEEngine
+from deimos_stream.memory_budget import SlotPlan, SlotsArg, parse_slots_arg, plan_slots
 from deimos_stream.mlx_hybrid import DeimosMLXHybridMoEEngine
 from deimos_stream.torch_arena import HAS_TORCH
 from deimos_stream.torch_engine import TorchDeimosPagedMoEEngine
@@ -64,7 +67,7 @@ def resolve_backend(backend: str = "auto") -> Optional[str]:
 def create_paged_moe_engine(
     store_dir: Path,
     backend: str = "auto",
-    slots_per_layer: int = 16,
+    slots_per_layer: SlotsArg = "auto",
     verify_merkle_on_cold: bool = True,
     use_nocache_pread: bool = False,
     enable_lookahead: bool = True,
@@ -72,64 +75,61 @@ def create_paged_moe_engine(
     miss_tail_tau: float = 1.0,
     min_k: int = 4,
     top_k: Optional[int] = None,
+    max_memory_gb: Optional[float] = None,
+    backbone: str = "fp16",
 ) -> AnyDeimosEngine:
-    """Instantiates `DeimosPagedMoEEngine` (`mlx`), `TorchDeimosPagedMoEEngine`, or `DeimosHFHybridMoEEngine`."""
-    sdir = Path(store_dir).expanduser().resolve()
-    mf_path = sdir / "merkle_manifest.json"
-    if mf_path.exists():
-        mf = json.loads(mf_path.read_text())
-        if mf.get("store_kind") == "hf_hybrid_q4" or (sdir / "hf_backbone.safetensors").exists():
-            resolved_h = resolve_backend(backend)
-            if resolved_h == "mlx":
-                return DeimosMLXHybridMoEEngine(
-                    store_dir=sdir,
-                    slots_per_layer=slots_per_layer,
-                    verify_merkle_on_cold=verify_merkle_on_cold,
-                    use_nocache_pread=use_nocache_pread,
-                    enable_lookahead=enable_lookahead,
-                    enable_merkle_kv=enable_merkle_kv,
-                    miss_tail_tau=miss_tail_tau,
-                    min_k=min_k,
-                    top_k=top_k,
-                )
-            dev_str = "cuda" if (resolved_h == "cuda") else "cpu"
-            return DeimosHFHybridMoEEngine(
-                store_dir=sdir,
-                device_str=dev_str,
-                slots_per_layer=slots_per_layer,
-                verify_merkle_on_cold=verify_merkle_on_cold,
-                use_nocache_pread=use_nocache_pread,
-                enable_lookahead=enable_lookahead,
-                enable_merkle_kv=enable_merkle_kv,
-                miss_tail_tau=miss_tail_tau,
-                min_k=min_k,
-                top_k=top_k,
-            )
+    """Instantiates `DeimosPagedMoEEngine` (`mlx`), `TorchDeimosPagedMoEEngine`, or `DeimosHFHybridMoEEngine`.
 
+    `slots_per_layer="auto"` (default) sizes the expert arena from free memory: all experts are
+    pinned when they fit, otherwise as many slots as fit (see `memory_budget.plan_slots`).
+    `max_memory_gb` optionally caps the total memory budget.
+    `backbone="q4"` quantizes attention + lm_head to 4-bit in memory (MLX dense engine only).
+    """
+    if backbone not in {"fp16", "q4"}:
+        raise ValueError(f"Unsupported backbone={backbone!r}; choose 'fp16' or 'q4'.")
+    sdir = Path(store_dir).expanduser().resolve()
     resolved = resolve_backend(backend)
-    if resolved == "mlx":
-        return DeimosPagedMoEEngine(
-            store_dir=store_dir,
-            slots_per_layer=slots_per_layer,
-            verify_merkle_on_cold=verify_merkle_on_cold,
-            use_nocache_pread=use_nocache_pread,
-            enable_lookahead=enable_lookahead,
-            enable_merkle_kv=enable_merkle_kv,
-            miss_tail_tau=miss_tail_tau,
-            min_k=min_k,
-            top_k=top_k,
-        )
-    if resolved in {"cuda", "cpu"}:
-        return TorchDeimosPagedMoEEngine(
-            store_dir=store_dir,
-            device_str=resolved,
-            slots_per_layer=slots_per_layer,
-            verify_merkle_on_cold=verify_merkle_on_cold,
-            use_nocache_pread=use_nocache_pread,
-            enable_lookahead=enable_lookahead,
-            enable_merkle_kv=enable_merkle_kv,
-            miss_tail_tau=miss_tail_tau,
-            min_k=min_k,
-            top_k=top_k,
-        )
-    raise RuntimeError("Neither MLX (macOS arm64) nor PyTorch (`deimos-stream[cuda]`) is installed.")
+    if resolved is None:
+        raise RuntimeError("Neither MLX (macOS arm64) nor PyTorch (`deimos-stream[cuda]`) is installed.")
+    plan: Optional[SlotPlan] = None
+    slots_arg = parse_slots_arg(slots_per_layer)
+    if slots_arg == "auto":
+        plan = plan_slots(sdir, resolved, max_memory_gb=max_memory_gb, top_k=top_k, backbone=backbone)
+        sys.stderr.write(plan.summary() + "\n")
+        slots = plan.slots_per_layer
+    else:
+        slots = int(slots_arg)
+    common = dict(
+        store_dir=sdir,
+        slots_per_layer=slots,
+        verify_merkle_on_cold=verify_merkle_on_cold,
+        use_nocache_pread=use_nocache_pread,
+        enable_lookahead=enable_lookahead,
+        enable_merkle_kv=enable_merkle_kv,
+        miss_tail_tau=miss_tail_tau,
+        min_k=min_k,
+        top_k=top_k,
+    )
+
+    mf_path = sdir / "merkle_manifest.json"
+    is_hybrid = (sdir / "hf_backbone.safetensors").exists()
+    if mf_path.exists() and not is_hybrid:
+        is_hybrid = json.loads(mf_path.read_text()).get("store_kind") == "hf_hybrid_q4"
+
+    eng: AnyDeimosEngine
+    if is_hybrid:
+        if resolved == "mlx":
+            eng = DeimosMLXHybridMoEEngine(**common)  # type: ignore[arg-type]
+        else:
+            eng = DeimosHFHybridMoEEngine(device_str=resolved, **common)  # type: ignore[arg-type]
+    elif resolved == "mlx":
+        eng = DeimosPagedMoEEngine(**common)  # type: ignore[arg-type]
+    else:
+        eng = TorchDeimosPagedMoEEngine(device_str=resolved, **common)  # type: ignore[arg-type]
+    if backbone == "q4":
+        if not isinstance(eng, DeimosPagedMoEEngine):
+            eng.close()
+            raise ValueError("--backbone q4 currently supports the MLX dense MoE engine (Apple Silicon) only.")
+        apply_q4_backbone(eng)
+    eng.slot_plan = plan  # type: ignore[union-attr]
+    return eng

@@ -52,6 +52,8 @@ By combining a **16 KB Page-Aligned 4-Bit Cryptographic Merkle Store (`DEIMIDX2`
 
 * **Bit-Exact Streaming Guarantee (`--tau 1.0`)**: Running `DeimosPagedMoEEngine(..., slots_per_layer=8, miss_tail_tau=1.0)` produces **`0.00000000` (`0.0`) maximum logit difference** and **100% identical greedy tokens** against Full-64-Slot Pinned Q4 despite continuous LFU+LRU page evictions.
 * **Warm Multi-Turn Merkle KV-Prefix Cache**: Across full process restarts on a 54-token prompt, `MerkleKVPrefixCache` verifies and restores `48/54` cached prompt tokens in `O(1)` via `DEIMIDX2` Robin-Hood hashing, cutting cold-restart TTFT **`4.29x` (`1,014.5 ms -> 236.4 ms`)** with exact output parity.
+* **Auto memory sizing (`--slots auto`, default)**: DeimosStream reads free memory at startup (unified memory on Mac, free VRAM on CUDA). It pins every expert when the model fits, and otherwise uses as many slots as fit. Measured on M4 Max with OLMoE-1B-7B: no cap gives `64/64` pinned at `259 tok/s`, `--max-memory-gb 3` gives `26/64` slots at `57.7 tok/s` (`2.06 GiB` Metal peak), and `--max-memory-gb 2` gives `8/64` slots at `45.1 tok/s` (`1.09 GiB` Metal peak).
+* **Pipelined decode + optional `--backbone q4`**: when every expert is pinned, the token loop queues step t+1 with `mx.async_eval` before reading token t (the mlx-lm approach). Greedy tokens are identical to the synchronous loop, and that is verified in tests. `--backbone q4` quantizes attention + lm_head to 4-bit in memory, while routers, norms and experts are unchanged. Measured on M4 Max with OLMoE-1B-7B, 6-run medians interleaved with mlx-lm in the same session: default FP16 backbone `259 -> 287 tok/s` (PPL `11.50`), `--backbone q4` `381 tok/s` (PPL `11.52`, `3.91 GiB` Metal peak) vs mlx-lm Q4 `392 tok/s` (PPL `11.74`, `4.07 GB`).
 
 ---
 
@@ -153,7 +155,15 @@ deimos-stream convert \
 # 2. Cryptographically verify the Tier-1 XOR Merkle tree & all Tier-2 SHA-256 expert leaves:
 deimos-stream inspect --store-dir ./qwen36_35b_deimos_q4 --verify-leaves
 
-# 3. Launch interactive Low-VRAM streaming chat (Qwen3.6-35B inside 5.32 GiB VRAM on a single T4):
+# 3. Launch streaming chat. `--slots auto` (default) pins every expert when memory allows,
+#    otherwise it uses as many slots as fit in free memory. Add `--max-memory-gb N` to cap the budget:
+deimos-stream chat --store-dir ./qwen36_35b_deimos_q4 --tau 0.85
+deimos-stream chat --store-dir ./qwen36_35b_deimos_q4 --tau 0.85 --max-memory-gb 6
+
+# Apple Silicon dense MoE (e.g. OLMoE): 4-bit attention + lm_head for extra decode speed:
+deimos-stream chat --store-dir ./olmoe_deimos_q4 --backbone q4
+
+# Or fix the slot count yourself (Qwen3.6-35B inside 5.32 GiB VRAM on a single T4):
 deimos-stream chat --store-dir ./qwen36_35b_deimos_q4 --slots 32 --tau 0.85
 
 # Ultra-Low 3.74 GiB VRAM mode for 35B Qwen3.6 (or 1.06 GiB for 7B OLMoE):
@@ -161,7 +171,7 @@ deimos-stream chat --store-dir ./qwen36_35b_deimos_q4 --slots 8 --tau 0.85
 ```
 
 Inside interactive `deimos-stream chat`, switch VRAM budgets and routing thresholds live:
-* `/slots <8|16|32|64>` — hot-rebuild `PagedExpertArena` capacity on the fly
+* `/slots <auto|8|16|32|64>` — hot-rebuild `PagedExpertArena` capacity on the fly
 * `/tau <0.50..1.00>` — adjust Miss-Only Nucleus Dynamic-K (`1.00` = bit-exact Top-K)
 * `/lookahead <on|off>` — toggle C++17 cross-layer Residual Lookahead prefetch
 
@@ -174,7 +184,7 @@ deimos-stream serve \
   --store-dir ./olmoe_deimos_q4 \
   --host 127.0.0.1 \
   --port 8080 \
-  --slots 16 \
+  --slots auto \
   --tau 0.85 \
   --model-name olmoe-1b-7b-q4
 ```

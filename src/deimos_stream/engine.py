@@ -18,7 +18,7 @@ import math
 import mmap
 from pathlib import Path
 import time
-from typing import Dict, List, Optional, Sequence, Tuple, TypedDict
+from typing import Dict, List, Optional, Sequence, Tuple, TypedDict, Union
 
 import numpy as np
 
@@ -36,6 +36,7 @@ except ImportError:
 
 from deimos_stream.arena import ArenaStats, DeimosMerkleBridge, PagedExpertArena
 from deimos_stream.backbone import load_backbone, mlx_mem_mb, rss_mb
+from deimos_stream.fast_decode import iter_decode_tokens
 from deimos_stream.kv_cache import MerkleKVPrefixCache
 from deimos_stream.merkle_builder import convert_fp16_cas_store_to_q4
 
@@ -208,6 +209,12 @@ class DeimosPagedMoEEngine:
         )
         self.backend_name: str = "mlx"
         self.route_fn = _make_compiled_router(self.top_k, self.norm_topk_prob)
+        self.lm_head_bits, self.lm_head_group_size, self.backbone = 8, 64, "fp16"
+        self.accepts_mx_tokens, self.pipelined_decode = True, True  # see fast_decode.py
+        self._emb_gpu: Optional[mx.array] = None  # pinned-mode GPU copy for pipelined decode
+        if self.arena.is_fully_pinned:
+            self._emb_gpu = mx.array(self.emb_np_view)
+            mx.eval(self._emb_gpu)
         mx.clear_cache()
         mx.reset_peak_memory()
 
@@ -266,12 +273,16 @@ class DeimosPagedMoEEngine:
 
     def forward_logits(
         self,
-        token_ids: Sequence[int],
+        token_ids: Union[Sequence[int], mx.array],
         caches: Optional[List[KVCache]] = None,
         all_positions: bool = False,
     ) -> mx.array:
-        emb_np = self.emb_np_view[list(token_ids)][None, :, :]
-        h = mx.array(emb_np)
+        if isinstance(token_ids, mx.array):  # lazy token from the pipelined decode loop
+            if self._emb_gpu is None:
+                self._emb_gpu = mx.array(self.emb_np_view)
+            h = self._emb_gpu[token_ids][None, :, :]
+        else:
+            h = mx.array(self.emb_np_view[list(token_ids)][None, :, :])
         mask = create_attention_mask(h, caches[0] if caches is not None else None)
         is_single_tok = len(token_ids) == 1
         max_toks_per_chunk = max(1, self.arena.slots_per_layer // self.top_k)
@@ -346,8 +357,8 @@ class DeimosPagedMoEEngine:
             self.lm_head_qs,
             self.lm_head_qb,
             transpose=True,
-            group_size=64,
-            bits=8,
+            group_size=self.lm_head_group_size,
+            bits=self.lm_head_bits,
         )
         return logits if all_positions else logits.squeeze(1)
 
@@ -380,13 +391,8 @@ class DeimosPagedMoEEngine:
         ttft_ms = (time.perf_counter() - t_pf) * 1000.0
 
         self.arena.reset_telemetry()
-        gen_ids = [int(tok.item())]
         t_dec = time.perf_counter()
-        for _ in range(max_new_tokens):
-            logits = self.forward_logits([gen_ids[-1]], caches=caches)
-            tok = mx.argmax(logits, axis=-1)
-            mx.eval(tok)
-            gen_ids.append(int(tok.item()))
+        gen_ids = list(iter_decode_tokens(self, logits, caches, max_new_tokens + 1))
         decode_sec = max(1e-6, time.perf_counter() - t_dec)
         self.arena.wait_idle()
 

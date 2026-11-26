@@ -4,9 +4,9 @@ DeimosStream CLI & Interactive Streaming Runner (`src/deimos_stream/cli.py`)
 ============================================================================
 Subcommands:
   - `deimos-stream convert --model-dir <safetensors_dir> --output-dir <store_dir>`
-  - `deimos-stream serve --store-dir <store_dir> --backend auto --port 8080 --slots 16`
-  - `deimos-stream chat --store-dir <store_dir> --backend auto --slots 16 --tau 0.85`
-  - `deimos-stream bench --store-dir <store_dir> --backend auto --slots 16 --tokens 64`
+  - `deimos-stream serve --store-dir <store_dir> --backend auto --port 8080 --slots auto`
+  - `deimos-stream chat --store-dir <store_dir> --backend auto --slots auto --tau 0.85`
+  - `deimos-stream bench --store-dir <store_dir> --backend auto --slots auto --tokens 64`
   - `deimos-stream inspect --store-dir <store_dir>`
 """
 
@@ -24,7 +24,9 @@ from deimos_stream.backbone import rss_mb
 from deimos_stream.converter import convert_safetensors_moe_to_deimos_q4
 from deimos_stream.detokenizer import IncrementalStreamingDetokenizer
 from deimos_stream.factory import AnyDeimosEngine, create_paged_moe_engine
+from deimos_stream.fast_decode import iter_decode_tokens, supports_pipeline
 from deimos_stream.hf_converter import convert_hf_hybrid_moe_to_deimos
+from deimos_stream.memory_budget import SlotsArg, parse_slots_arg
 
 
 class DeimosChatSession:
@@ -34,21 +36,27 @@ class DeimosChatSession:
         self,
         store_dir: Path,
         backend: str = "auto",
-        slots_per_layer: int = 16,
+        slots_per_layer: SlotsArg = "auto",
         miss_tail_tau: float = 0.85,
         enable_lookahead: bool = True,
         enable_merkle_kv: bool = True,
         use_nocache_pread: bool = True,
         verify_merkle_on_cold: bool = True,
         temperature: float = 0.0,
+        max_memory_gb: Optional[float] = None,
+        backbone: str = "fp16",
     ):
         self.store_dir: Path = Path(store_dir).expanduser().resolve()
         self.backend: str = backend
         self.temperature: float = max(0.0, float(temperature))
+        self.max_memory_gb: Optional[float] = max_memory_gb
+        self.backbone: str = backbone
         self.engine: AnyDeimosEngine = create_paged_moe_engine(
             self.store_dir,
             backend=self.backend,
             slots_per_layer=slots_per_layer,
+            max_memory_gb=max_memory_gb,
+            backbone=backbone,
             verify_merkle_on_cold=verify_merkle_on_cold,
             use_nocache_pread=use_nocache_pread,
             enable_lookahead=enable_lookahead,
@@ -101,24 +109,23 @@ class DeimosChatSession:
 
         t_pf = time.perf_counter()
         logits, skipped = self.engine.prefill_prompt(prompt_ids, caches)  # type: ignore[arg-type]
-        tok_id = self.engine.sample_next_token(logits, temperature=self.temperature)  # type: ignore[arg-type]
         ttft_ms = (time.perf_counter() - t_pf) * 1000.0
 
         self.engine.arena.reset_telemetry()
         gen_ids: List[int] = []
         t_dec = time.perf_counter()
-
-        for step in range(max_new_tokens):
-            if tok_id in self.stop_ids:
-                break
-            gen_ids.append(tok_id)
-            delta = detok.add_token(tok_id)
-            if print_live and delta:
-                sys.stdout.write(delta)
-                sys.stdout.flush()
-            if step + 1 < max_new_tokens:
-                logits = self.engine.forward_logits([tok_id], caches=caches)  # type: ignore[arg-type]
-                tok_id = self.engine.sample_next_token(logits, temperature=self.temperature)  # type: ignore[arg-type]
+        gen = iter_decode_tokens(
+            self.engine, logits, caches, max_new_tokens, self.temperature, self.stop_ids
+        )
+        try:
+            for tok_id in gen:
+                gen_ids.append(tok_id)
+                delta = detok.add_token(tok_id)
+                if print_live and delta:
+                    sys.stdout.write(delta)
+                    sys.stdout.flush()
+        finally:
+            gen.close()
 
         decode_sec = max(1e-6, time.perf_counter() - t_dec)
         self.engine.arena.wait_idle()
@@ -201,7 +208,7 @@ class DeimosChatSession:
         print(
             f"\n[DeimosStream Ready | Backend: {self.engine.backend_name.upper()}] Store: {self.engine.store_dir} | "
             f"Slots/Layer: {self.engine.arena.slots_per_layer}/{self.engine.num_experts}\n"
-            "Commands: /slots <8|16|32|64>, /tau <0.5..1.0>, /lookahead <on|off>, /clear, exit\n"
+            "Commands: /slots <auto|8|16|32|64>, /tau <0.5..1.0>, /lookahead <on|off>, /clear, exit\n"
         )
         while True:
             try:
@@ -226,7 +233,7 @@ class DeimosChatSession:
                 print(f"[Updated enable_lookahead = {self.engine.enable_lookahead}]")
                 continue
             if user_in.startswith("/slots "):
-                new_slots = int(user_in.split()[1])
+                new_slots = parse_slots_arg(user_in.split()[1])
                 la = self.engine.enable_lookahead
                 tau = self.engine.miss_tail_tau
                 kv = self.engine.enable_merkle_kv
@@ -237,6 +244,8 @@ class DeimosChatSession:
                     self.store_dir,
                     backend=b_name,
                     slots_per_layer=new_slots,
+                    max_memory_gb=self.max_memory_gb,
+                    backbone=self.backbone,
                     use_nocache_pread=nc,
                     enable_lookahead=la,
                     enable_merkle_kv=kv,
@@ -310,7 +319,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p_chat = sub.add_parser("chat", help="Launch interactive or single-turn low-VRAM MoE chat")
     p_chat.add_argument("--store-dir", type=Path, required=True, help="DEIMIDX2 store folder")
     p_chat.add_argument("--backend", type=str, default="auto", choices=["auto", "mlx", "cuda", "cpu"])
-    p_chat.add_argument("--slots", type=int, default=16, help="Q4 expert slots per layer in VRAM")
+    p_chat.add_argument("--slots", type=parse_slots_arg, default="auto", help="Expert slots per layer: auto (pin all if memory allows, else fit free memory) or a number")
+    p_chat.add_argument("--max-memory-gb", type=float, default=None, help="Cap the total memory budget for --slots auto")
+    p_chat.add_argument("--backbone", choices=["fp16", "q4"], default="fp16", help="q4: 4-bit attention + lm_head (faster, MLX dense only)")
     p_chat.add_argument("--tau", type=float, default=0.85, help="Miss-only Nucleus Dynamic-K tau")
     p_chat.add_argument("--no-lookahead", action="store_true")
     p_chat.add_argument("--no-kv-cache", action="store_true")
@@ -323,7 +334,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p_bench = sub.add_parser("bench", help="Benchmark VRAM, hit rate, TTFT, and decode tok/s")
     p_bench.add_argument("--store-dir", type=Path, required=True)
     p_bench.add_argument("--backend", type=str, default="auto", choices=["auto", "mlx", "cuda", "cpu"])
-    p_bench.add_argument("--slots", type=int, default=16)
+    p_bench.add_argument("--slots", type=parse_slots_arg, default="auto", help="Expert slots per layer: auto (pin all if memory allows, else fit free memory) or a number")
+    p_bench.add_argument("--max-memory-gb", type=float, default=None, help="Cap the total memory budget for --slots auto")
+    p_bench.add_argument("--backbone", choices=["fp16", "q4"], default="fp16", help="q4: 4-bit attention + lm_head (faster, MLX dense only)")
     p_bench.add_argument("--tau", type=float, default=0.85)
     p_bench.add_argument("--no-verify", action="store_true", help="Skip cold-load SHA-256 leaf verification")
     p_bench.add_argument("--tokens", type=int, default=32)
@@ -343,7 +356,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p_srv.add_argument("--backend", type=str, default="auto", choices=["auto", "mlx", "cuda", "cpu"])
     p_srv.add_argument("--host", type=str, default="127.0.0.1")
     p_srv.add_argument("--port", type=int, default=8080)
-    p_srv.add_argument("--slots", type=int, default=16, help="Q4 expert slots per layer in VRAM")
+    p_srv.add_argument("--slots", type=parse_slots_arg, default="auto", help="Expert slots per layer: auto (pin all if memory allows, else fit free memory) or a number")
+    p_srv.add_argument("--max-memory-gb", type=float, default=None, help="Cap the total memory budget for --slots auto")
+    p_srv.add_argument("--backbone", choices=["fp16", "q4"], default="fp16", help="q4: 4-bit attention + lm_head (faster, MLX dense only)")
     p_srv.add_argument("--tau", type=float, default=0.85, help="Miss-only Nucleus Dynamic-K tau")
     p_srv.add_argument("--no-lookahead", action="store_true")
     p_srv.add_argument("--no-kv-cache", action="store_true")
@@ -378,6 +393,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             args.store_dir,
             backend=args.backend,
             slots_per_layer=args.slots,
+            max_memory_gb=args.max_memory_gb,
+            backbone=args.backbone,
             verify_merkle_on_cold=not args.no_verify,
             use_nocache_pread=True,
             enable_lookahead=True,
@@ -388,6 +405,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 metrics = eng.benchmark_generation(args.prompt, max_new_tokens=args.tokens)
             else:
                 metrics = eng.benchmark_token_ids([1, 2, 3, 4, 5, 6, 7, 8], max_new_tokens=args.tokens)
+            plan = getattr(eng, "slot_plan", None)
+            metrics["slot_plan"] = plan.as_dict() if plan is not None else None  # type: ignore[index]
+            metrics["backbone"] = getattr(eng, "backbone", "fp16")  # type: ignore[index]
+            metrics["pipelined_decode"] = supports_pipeline(eng)  # type: ignore[index]
             print(json.dumps(metrics, indent=2))
         finally:
             eng.close()
@@ -403,6 +424,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             store_dir=args.store_dir,
             backend=args.backend,
             slots_per_layer=args.slots,
+            max_memory_gb=args.max_memory_gb,
+            backbone=args.backbone,
             miss_tail_tau=args.tau,
             enable_lookahead=not args.no_lookahead,
             enable_merkle_kv=not args.no_kv_cache,
@@ -422,6 +445,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             store_dir=args.store_dir,
             backend=args.backend,
             slots_per_layer=args.slots,
+            max_memory_gb=args.max_memory_gb,
+            backbone=args.backbone,
             miss_tail_tau=args.tau,
             enable_lookahead=not args.no_lookahead,
             enable_merkle_kv=not args.no_kv_cache,

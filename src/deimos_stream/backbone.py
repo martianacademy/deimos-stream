@@ -100,6 +100,9 @@ class UniversalAttention(_NNModuleBase):  # type: ignore[misc,valid-type]
 
         self.qkv_w = mx.contiguous(qkv_w)
         self.o_w = mx.contiguous(o_w)
+        self.qkv_q: Optional[Tuple[mx.array, mx.array, mx.array]] = None
+        self.o_q: Optional[Tuple[mx.array, mx.array, mx.array]] = None
+        self.q_group_size, self.q_bits = 64, 4
         self.q_norm: Optional[nn.RMSNorm] = None
         self.k_norm: Optional[nn.RMSNorm] = None
         self.per_head_qk_norm: bool = False
@@ -121,11 +124,28 @@ class UniversalAttention(_NNModuleBase):  # type: ignore[misc,valid-type]
             max_position_embeddings=8192,
         )
 
+    def quantize_weights(self, group_size: int = 64, bits: int = 4) -> None:
+        """Replaces the FP16 qkv/o projections with `mx.quantize` weights (`--backbone q4`)."""
+        self.qkv_q = mx.quantize(self.qkv_w, group_size=group_size, bits=bits)
+        self.o_q = mx.quantize(self.o_w, group_size=group_size, bits=bits)
+        mx.eval(self.qkv_q, self.o_q)
+        self.q_group_size, self.q_bits = int(group_size), int(bits)
+        self.pop("qkv_w", None)  # nn.Module keeps arrays as dict items; drop the FP16 copies
+        self.pop("o_w", None)
+
+    def _proj(self, x: mx.array, name: str) -> mx.array:
+        q = self.qkv_q if name == "qkv" else self.o_q
+        if q is None:
+            return x @ (self.qkv_w if name == "qkv" else self.o_w).T
+        return mx.quantized_matmul(
+            x, *q, transpose=True, group_size=self.q_group_size, bits=self.q_bits
+        )
+
     def __call__(
         self, x: mx.array, mask: Optional[mx.array], cache: Optional[KVCache]
     ) -> mx.array:
         B, L, _ = x.shape
-        qkv = x @ self.qkv_w.T
+        qkv = self._proj(x, "qkv")
         if self.q_dim == self.kv_dim:
             q, k, v = mx.split(qkv, 3, axis=-1)
         else:
@@ -154,7 +174,7 @@ class UniversalAttention(_NNModuleBase):  # type: ignore[misc,valid-type]
             k = self.rope(k)
 
         out = scaled_dot_product_attention(q, k, v, cache=cache, scale=self.scale, mask=mask)
-        return out.transpose(0, 2, 1, 3).reshape(B, L, -1) @ self.o_w.T
+        return self._proj(out.transpose(0, 2, 1, 3).reshape(B, L, -1), "o")
 
 
 if TYPE_CHECKING:

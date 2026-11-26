@@ -30,7 +30,7 @@ from deimos_stream.merkle_builder import (
 from deimos_stream.torch_arena import TorchPagedExpertArena
 from deimos_stream.torch_engine import TorchDeimosPagedMoEEngine
 
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 
 
 def __getattr__(name: str) -> object:
