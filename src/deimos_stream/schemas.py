@@ -6,7 +6,7 @@ DeimosStream OpenAI API Validation Schemas & Stop-Buffer Helpers (`src/deimos_st
 
 from __future__ import annotations
 
-from typing import List, Literal, Optional, Sequence, Tuple, Union
+from typing import Annotated, List, Literal, Optional, Sequence, Tuple, Union
 
 from pydantic import BaseModel, Field
 
@@ -29,7 +29,7 @@ class ChatCompletionRequest(BaseModel):
 
 
 class DeimosConfigUpdateRequest(BaseModel):
-    slots_per_layer: Optional[int] = Field(default=None, ge=1, le=512)
+    slots_per_layer: Optional[Union[Literal["auto"], Annotated[int, Field(ge=1, le=512)]]] = None
     miss_tail_tau: Optional[float] = Field(default=None, ge=0.5, le=1.0)
     enable_lookahead: Optional[bool] = None
 

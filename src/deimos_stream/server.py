@@ -28,6 +28,8 @@ from deimos_stream.backbone import rss_mb
 from deimos_stream.cli import inspect_store
 from deimos_stream.detokenizer import DecodeCapableTokenizer, IncrementalStreamingDetokenizer
 from deimos_stream.factory import AnyDeimosEngine, create_paged_moe_engine, resolve_backend
+from deimos_stream.fast_decode import iter_decode_tokens
+from deimos_stream.memory_budget import SlotsArg
 from deimos_stream.schemas import (
     ChatChoice,
     ChatChoiceMessage,
@@ -47,13 +49,15 @@ from deimos_stream.schemas import (
 def create_deimos_app(
     store_dir: Path,
     backend: str = "auto",
-    slots_per_layer: int = 16,
+    slots_per_layer: SlotsArg = "auto",
     miss_tail_tau: float = 0.85,
     enable_lookahead: bool = True,
     enable_merkle_kv: bool = True,
     use_nocache_pread: bool = True,
     verify_merkle_on_cold: bool = True,
     model_name: Optional[str] = None,
+    max_memory_gb: Optional[float] = None,
+    backbone: str = "fp16",
 ) -> FastAPI:
     """Creates a thread-safe OpenAI-compatible FastAPI app backed by `mlx`, `cuda`, or `cpu`."""
     resolved_dir = Path(store_dir).expanduser().resolve()
@@ -70,6 +74,8 @@ def create_deimos_app(
             store_dir=resolved_dir,
             backend=active_backend,
             slots_per_layer=slots_per_layer,
+            max_memory_gb=max_memory_gb,
+            backbone=backbone,
             verify_merkle_on_cold=verify_merkle_on_cold,
             use_nocache_pread=use_nocache_pread,
             enable_lookahead=enable_lookahead,
@@ -173,7 +179,7 @@ def create_deimos_app(
                 raise HTTPException(status_code=503, detail="No MLX or PyTorch execution runtime available.")
             if (
                 req.slots_per_layer is not None
-                and req.slots_per_layer != eng.arena.slots_per_layer
+                and (req.slots_per_layer == "auto" or req.slots_per_layer != eng.arena.slots_per_layer)
             ):
                 la = req.enable_lookahead if req.enable_lookahead is not None else eng.enable_lookahead
                 tau = req.miss_tail_tau if req.miss_tail_tau is not None else eng.miss_tail_tau
@@ -185,6 +191,8 @@ def create_deimos_app(
                     store_dir=resolved_dir,
                     backend=b_name,
                     slots_per_layer=req.slots_per_layer,
+                    max_memory_gb=max_memory_gb,
+                    backbone=backbone,
                     use_nocache_pread=nc,
                     enable_lookahead=la,
                     enable_merkle_kv=kv,
@@ -229,7 +237,6 @@ def create_deimos_app(
 
                 t_pf = time.perf_counter()
                 logits, skipped = eng.prefill_prompt(prompt_ids, caches)  # type: ignore[arg-type]
-                tok_id = eng.sample_next_token(logits, temperature=req.temperature)  # type: ignore[arg-type]
                 ttft_ms = (time.perf_counter() - t_pf) * 1000.0
 
                 eng.arena.reset_telemetry()
@@ -238,21 +245,21 @@ def create_deimos_app(
                 finish_reason = "length"
                 t_dec = time.perf_counter()
 
-                for step in range(max_new):
-                    if tok_id in stop_ids:
-                        finish_reason = "stop"
-                        break
-                    gen_ids.append(tok_id)
-                    pending_buf += detok.add_token(tok_id)
-                    safe_txt, pending_buf, hit_stop = _check_stop_buffer(pending_buf, stops)
-                    if safe_txt:
-                        yield ("delta", safe_txt, None, 0, 0)
-                    if hit_stop:
-                        finish_reason = "stop"
-                        break
-                    if step + 1 < max_new:
-                        logits = eng.forward_logits([tok_id], caches=caches)  # type: ignore[arg-type]
-                        tok_id = eng.sample_next_token(logits, temperature=req.temperature)  # type: ignore[arg-type]
+                gen = iter_decode_tokens(eng, logits, caches, max_new, req.temperature, stop_ids)
+                try:
+                    for tok_id in gen:
+                        gen_ids.append(tok_id)
+                        pending_buf += detok.add_token(tok_id)
+                        safe_txt, pending_buf, hit_stop = _check_stop_buffer(pending_buf, stops)
+                        if safe_txt:
+                            yield ("delta", safe_txt, None, 0, 0)
+                        if hit_stop:
+                            finish_reason = "stop"
+                            break
+                finally:
+                    gen.close()
+                if finish_reason != "stop" and len(gen_ids) < max_new:
+                    finish_reason = "stop"  # the generator ended on a stop token id
 
                 if pending_buf and finish_reason != "stop":
                     yield ("delta", pending_buf, None, 0, 0)
