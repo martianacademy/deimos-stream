@@ -7,13 +7,34 @@
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-brightgreen.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/martianacademy/deimos-stream/blob/main/LICENSE)
 
-**DeimosStream** is a universal low-VRAM **Sparse Mixture-of-Experts (MoE) LLM streaming engine** — the language-model twin to [**PhobosStream**](https://github.com/martianacademy/phobos-stream) — built to run large Sparse MoE models (**`OLMoE`**, **`Qwen2/3-MoE`**, **`Mixtral`**, **`DeepSeek-MoE`**) inside a tiny, strictly bounded GPU memory footprint with **cryptographic Merkle proof verification** on every cold expert page streamed from NVMe SSD.
+**DeimosStream** is a universal low-VRAM **Sparse Mixture-of-Experts (MoE) LLM streaming engine** — the language-model twin to [**PhobosStream**](https://github.com/martianacademy/phobos-stream) — built to run massive 2026 Sparse & Hybrid MoE models (**`Qwen3.6-35B-A3B`**, **`Qwen3.5/3-MoE`**, **`OLMoE`**, **`Mixtral`**, **`DeepSeek-MoE`**) inside a tiny, strictly bounded GPU memory footprint with **cryptographic Merkle proof verification** on every cold expert page streamed from SSD.
 
-By combining a **16 KB Page-Aligned 4-Bit Cryptographic Merkle Store (`DEIMIDX2`)**, a **Pre-Allocated Unified-Memory `PagedExpertArena`** (`mx.gather_qmm`), **Zero-GIL C++17 Cross-Layer Residual Lookahead**, and **Cache-Aware Miss-Only Nucleus Dynamic-K**, DeimosStream cuts Peak Metal GPU Memory on a real **13.20 GiB (`6.92B`) Sparse MoE model from `13,613.4 MiB` down to `1,086.8–1,518.8 MiB` (`88.8%–92.0%` VRAM reduction)** while sustaining **`45.5–57.4 tok/s`** with **zero prefill VRAM spikes** and **no perplexity degradation**.
+By combining a **16 KB Page-Aligned 4-Bit Cryptographic Merkle Store (`DEIMIDX2`)**, a **Zero-RAM `meta`-Skeleton Hybrid Streamer**, a **Pre-Allocated `PagedExpertArena`** (`MLX` `mx.gather_qmm` on Apple Silicon • `CUDA` `pin_memory=True` async stream DMA on NVIDIA GPUs), **Zero-GIL C++17 Cross-Layer Residual Lookahead**, and **Cache-Aware Miss-Only Nucleus Dynamic-K**, DeimosStream runs:
+* **35B `Qwen/Qwen3.6-35B-A3B` (`66.97 GiB` BF16, `10,240` experts)** on a **single 15 GB NVIDIA Tesla T4 GPU** inside **`3.74–5.32 GiB` Active VRAM (`-91.2%` to `-93.9%` VRAM saved)** with **`0.00000000` bit-exact CUDA logit parity** (`8` vs `32` slots @ `tau=1.0`) and **100% (`10,240/10,240`) cold SHA-256 Merkle proofs verified** — even on a **12.7 GiB RAM Free Colab VM** where CPU RAM + GPU VRAM combined (`27 GiB`) is `2.5×` smaller than the model!
+* **6.92B `OLMoE-1B-7B` (`13.20 GiB` FP16)** on **Apple Silicon (`M4 Max` Metal)** inside **`1.06–1.48 GiB` VRAM (`-88.8%` to `-92.0%` saved)** at **`45.5–57.4 tok/s`** with **zero prefill VRAM spikes** and **no perplexity degradation**.
 
 ---
 
-## 📊 Verified Empirical Benchmarks (`OLMoE-1B-7B`, 6.92B Params / 13.20 GiB FP16)
+## 🚀 Verified 2026 Frontier MoE CUDA Benchmark (`Qwen/Qwen3.6-35B-A3B`, 35B Params / 66.97 GiB BF16)
+
+*Measured end-to-end with `deimos-stream==0.3.1` (`PyTorch 2.11+cu130`, `Transformers 5.24.1`) on a **single NVIDIA `Tesla T4` (`14.56 GiB` VRAM)** running **`Qwen/Qwen3.6-35B-A3B`** (`40` hybrid layers: `30` GatedDeltaNet + `10` GQA × `256` experts = **`10,240` experts**, `Top-8` active, `248,320` vocab). Standard BF16 (`66.97 GiB`, `4.6×` larger than T4) and full-resident Q4 (`~21 GiB`) both immediately OOM on a single T4.*
+
+| Configuration (`Tesla T4`, Kaggle `30 GiB` Host RAM) | Active / Peak CUDA VRAM | VRAM Saved vs BF16 | Expert Arena Pool | Expert Cache Hit Rate | Residual Lookahead Hits | Decode Speed (`64` tok) |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Monolithic BF16 Baseline (`Qwen3.6-35B-A3B`)** | **66,965 MiB (`OOM` on T4)** | `0.0%` | — | `100.0%` | — | `OOM (>4.6× T4)` |
+| **DeimosStream Ultra-Low (`--slots 8 --tau 0.85`)** | **`3,830.6` / `4,214.9 MiB`** | **`-93.85%`** *(4–6 GB GPU)* | `540.0 MiB` (`3.1%`) | **`85.77%`** | **`8,287`** | **`1.65 tok/s`** |
+| **DeimosStream Low-VRAM (`--slots 16 --tau 0.85`)** | **`4,370.6` / `4,754.9 MiB`** | **`-93.07%`** *(6 GB GPU)* | `1,080.0 MiB` (`6.3%`) | **`89.56%`** | **`6,512`** | **`1.84 tok/s`** |
+| **DeimosStream T4 Sweet Spot (`--slots 32 --tau 0.85`)** | **`5,449.7` / `6,066.3 MiB`** | **`-91.15%`** *(8 GB GPU)* | `2,160.0 MiB` (`12.5%`) | **`93.25%`** | **`4,590`** | **`2.61 tok/s`** |
+| **DeimosStream Exact Zero-Skip (`--slots 32 --tau 1.00`)** | **`5,449.7` / `6,066.3 MiB`** | **`-91.15%`** | `2,160.0 MiB` (`12.5%`) | **`87.93%`** | **`4,398`** | **`2.56 tok/s`** *(Avg K=8.0)* |
+| **DeimosStream High-Hit (`--slots 64 --tau 0.85`)** | **`7,609.7` / `8,841.6 MiB`** | **`-87.11%`** *(12 GB GPU)* | `4,320.0 MiB` (`25.0%`) | **`95.61%`** | **`2,308`** | **`1.98 tok/s`** |
+
+* **Bit-Exact 35B CUDA Parity (`--tau 1.0`)**: Verified `max_abs_diff = 0.00000000` (`top1 = (2, 2)`) across all `248,320` logits and all `40` hybrid layers between `8/256`-slot and `32/256`-slot paging on real NVIDIA `Tesla T4` CUDA hardware (WAW/WAR CUDA stream fence + per-layer DMA `torch.cuda.Event` sync).
+* **Cryptographic Integrity at 10,240-Expert Scale**: Converted `66.965 GiB` BF16 -> **`20.985 GiB`** `DEIMIDX2` Q4 store in `526.96s` via shard-by-shard deletion (`cas_experts_q4.bin`: `17,280 MiB`, `hf_backbone.safetensors`: `2,730 MiB`, `embed_tokens.bin`: `970 MiB` zero-VRAM CPU `mmap`, `lm_head_int8.bin`: `485.5 MiB`, `merkle_tree.idx`: `1.70 MiB`); verified Tier-1 startup root (`35.3–70.2 ms`) and **`10,240 / 10,240` (`100%`) cold SHA-256 leaf proofs** (`model_merkle_root: 40b90275ba8b...`).
+* **Extreme Constrained Host Verification (Free Google Colab `Tesla T4`, `12.67 GiB` Host RAM, `0` Swap)**: Successfully converted and streamed the entire `66.97 GiB` model inside `3,829.2 MiB` Active / `4,213.5 MiB` Peak VRAM (`-93.86%`, `86.6%–95.99%` hit rate, `0.71–1.21 tok/s` over Colab network Persistent Disk) with zero OOMs. *(Note: `slots=128` on T4 requires ~13.0 GiB base VRAM leaving insufficient scratch headroom on 14.56 GiB T4; `slots=32` is the optimal pinned-DMA operating point on 15 GB T4 GPUs.)*
+
+---
+
+## 📊 Verified Apple Silicon MLX Benchmarks (`OLMoE-1B-7B`, 6.92B Params / 13.20 GiB FP16)
 
 *Measured end-to-end on Apple Silicon (`M4 Max` Metal GPU, real `F_NOCACHE` random NVMe `pread` measured at `2.03–2.96 GiB/s`) on `allenai/OLMoE-1B-7B-0125-Instruct` (`16 layers × 64 experts = 1,024` SwiGLU experts, `Top-8` active per token):*
 
@@ -77,14 +98,14 @@ Why Sparse MoE streaming achieves `45–57 tok/s` while dense weight streaming c
 * A **dense** model touches **100%** of its parameters on every single token (`e.g. 14 GB / 3 GB/s ≈ 0.2 tok/s` physics ceiling).
 * A **Sparse MoE** activates only **$k / E$ (`3%–12.5%`)** of expert parameters per token, exhibits strong conversational topic locality (`88%–93%` hit rate in a `12.5%–25%` slot arena), and exposes cross-layer residual predictability (`~84%` lookahead recall).
 
-| Sparse MoE Model Class | Original FP16 Size | Q4 `DEIMIDX2` Disk Store | Active Backbone + KV | Paged Arena (`16–25%` Slots) | Total GPU VRAM Needed |
+| Sparse MoE Model Class | Original BF16/FP16 Size | Q4 `DEIMIDX2` Disk Store | Active Backbone + Head | Paged Arena (`3%–25%` Slots) | Total GPU VRAM Needed |
 | :--- | :---: | :---: | :---: | :---: | :---: |
-| **`OLMoE-1B-7B` (6.9B, A1.3B)** *(Verified)* | `13.2 GiB` | `3.38 GiB` | `~0.65 GiB` | `0.43–0.86 GiB` (`8–16/64`) | **`1.08 – 1.52 GiB`** |
-| **`Qwen3-30B-A3B` (30.5B, 128E Top-8)** | `~61 GiB` | `~15.5 GiB` | `~1.6 GiB` | `~2.4 GiB` (`20/128`) | **`~4.0 – 4.5 GiB`** *(8 GB Mac)* |
-| **`Mixtral-8x7B` (46.7B, 8E Top-2)** | `~93 GiB` | `~23.5 GiB` | `~2.1 GiB` | `~3.8 GiB` (`2–3/8`) | **`~5.8 – 6.5 GiB`** *(8–16 GB Mac)* |
-| **`Qwen3-235B-A22B` (235B, 128E Top-8)** | `~470 GiB` | `~118 GiB` | `~8.5 GiB` | `~11.5 GiB` (`16/128`) | **`~20 – 22 GiB`** *(24–32 GB Mac)* |
+| **`OLMoE-1B-7B` (6.9B, A1.3B)** *(Verified MLX)* | `13.2 GiB` | `3.38 GiB` | `~0.65 GiB` | `0.43–0.86 GiB` (`8–16/64`) | **`1.08 – 1.52 GiB`** |
+| **`Qwen/Qwen3.6-35B-A3B` (35B, 256E Top-8)** *(Verified T4 CUDA)* | **`66.97 GiB`** | **`20.99 GiB`** | **`3.21 GiB`** *(0-VRAM mmap emb)* | **`0.53–2.11 GiB`** (`8–32/256`) | **`3.74 – 5.32 GiB`** *(Single T4 / 6–8 GB GPU)* |
+| **`Mixtral-8x7B` (46.7B, 8E Top-2)** | `~93 GiB` | `~23.5 GiB` | `~2.1 GiB` | `~3.8 GiB` (`2–3/8`) | **`~5.8 – 6.5 GiB`** *(8–16 GB GPU)* |
+| **`Qwen3-235B-A22B` (235B, 128E Top-8)** | `~470 GiB` | `~118 GiB` | `~8.5 GiB` | `~11.5 GiB` (`16/128`) | **`~20 – 22 GiB`** *(24–32 GB GPU)* |
 
-*(Note: `OLMoE-1B-7B` figures are live hardware measurements on M4 Max; larger rows show analytical `DEIMIDX2` Q4 memory footprints from exact tensor dimensions.)*
+*(Note: `OLMoE-1B-7B` on Apple M4 Max and `Qwen/Qwen3.6-35B-A3B` on NVIDIA Tesla T4 are live hardware measurements; Mixtral/235B rows show analytical `DEIMIDX2` Q4 footprints from exact tensor dimensions.)*
 
 ---
 
@@ -110,24 +131,29 @@ pytest -v
 ```
 *(Hardware routing `--backend auto`: on Apple Silicon, DeimosStream always selects native **`mlx`** rather than `mps` for zero-copy Unified-Memory pointers and fused 4-bit `mx.gather_qmm` Metal kernels; on Linux/Windows with NVIDIA/ROCm GPUs, it selects **`cuda`** with `pin_memory=True` async PCIe stream DMA and ABA-safe `slot_gen` slot synchronization over the exact same `DEIMIDX2` Merkle store.)*
 
-### 2. Convert Any `.safetensors` Sparse MoE Checkpoint & Stream Chat
+### 2. Convert Any `.safetensors` or HuggingFace 2026 Hybrid-MoE Checkpoint & Stream Chat
 
-Supports HuggingFace & MLX `.safetensors` checkpoints across **`OLMoE`**, **`Qwen2-MoE` / `Qwen3-MoE`** (including GQA, per-head QK-Norm, and `shared_expert`), **`Mixtral`** (`w1/w2/w3`), and **`DeepSeek-MoE`**:
+Supports local `.safetensors` checkpoints **and direct shard-by-shard HuggingFace Hub streaming** across **`Qwen3.6-35B-A3B` / `Qwen3.5-MoE`** (hybrid GatedDeltaNet + GQA + 256 experts), **`OLMoE`**, **`Qwen2/3-MoE`**, **`Mixtral`**, and **`DeepSeek-MoE`**:
 
 ```bash
-# 1. Convert a .safetensors Sparse MoE checkpoint into a 16 KB page-aligned DEIMIDX2 Q4 store:
+# 1a. Stream & convert 2026 35B Qwen/Qwen3.6-35B-A3B (66.97 GiB BF16 -> 20.99 GiB DEIMIDX2 Q4, auto-deleting shards):
+deimos-stream convert \
+  --model-dir Qwen/Qwen3.6-35B-A3B \
+  --output-dir ./qwen36_35b_deimos_q4
+
+# 1b. Or convert any local .safetensors Sparse MoE (e.g. OLMoE-1B-7B):
 deimos-stream convert \
   --model-dir /path/to/OLMoE-1B-7B-0125-Instruct \
   --output-dir ./olmoe_deimos_q4
 
 # 2. Cryptographically verify the Tier-1 XOR Merkle tree & all Tier-2 SHA-256 expert leaves:
-deimos-stream inspect --store-dir ./olmoe_deimos_q4 --verify-leaves
+deimos-stream inspect --store-dir ./qwen36_35b_deimos_q4 --verify-leaves
 
-# 3. Launch interactive Low-VRAM streaming chat (1.52 GiB VRAM @ ~56 tok/s):
-deimos-stream chat --store-dir ./olmoe_deimos_q4 --slots 16 --tau 0.85
+# 3. Launch interactive Low-VRAM streaming chat (Qwen3.6-35B inside 5.32 GiB VRAM on a single T4):
+deimos-stream chat --store-dir ./qwen36_35b_deimos_q4 --slots 32 --tau 0.85
 
-# Ultra-Low 1.08 GiB VRAM mode (8 slots/layer):
-deimos-stream chat --store-dir ./olmoe_deimos_q4 --slots 8 --tau 0.85
+# Ultra-Low 3.74 GiB VRAM mode for 35B Qwen3.6 (or 1.06 GiB for 7B OLMoE):
+deimos-stream chat --store-dir ./qwen36_35b_deimos_q4 --slots 8 --tau 0.85
 ```
 
 Inside interactive `deimos-stream chat`, switch VRAM budgets and routing thresholds live:

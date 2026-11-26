@@ -205,7 +205,7 @@ class DeimosPagedHFExperts(_NNModule):  # type: ignore[misc,valid-type]
 
         ind_np = top_k_index.detach().cpu().numpy().astype(np.int32)
         sc_np = top_k_weights.detach().float().cpu().numpy()
-        max_chunk = max(1, self.arena.slots_per_layer // max(1, top_k))
+        max_chunk = min(4, max(1, self.arena.slots_per_layer // max(1, top_k)))
 
         if N <= max_chunk:
             phys_np, eff_sc_np = self.arena.resolve_and_prefetch(
