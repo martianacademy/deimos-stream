@@ -226,6 +226,7 @@ def convert_hf_hybrid_moe_to_deimos(
     emb_bytes = emb_t.numpy().tobytes()
     (out_dir / "embed_tokens.bin").write_bytes(emb_bytes)
     emb_root = hashlib.sha256(emb_bytes).digest()
+    del emb_bytes
 
     lm_key_cands = ("lm_head.weight", "language_model.lm_head.weight")
     lm_key = next((k for k in lm_key_cands if k in active_keys), None)
@@ -325,9 +326,10 @@ def convert_hf_hybrid_moe_to_deimos(
 
     bb_path = out_dir / "hf_backbone.safetensors"
     st_save_torch(backbone_sd, str(bb_path))
-    core_root = hashlib.sha256(bb_path.read_bytes()).digest()
     backbone_sd.clear()
     gc.collect()
+    with open(bb_path, "rb") as f_bb:
+        core_root = hashlib.file_digest(f_bb, "sha256").digest()
     shutil.rmtree(tmp_dl, ignore_errors=True)
 
     # Save normalized text config (`config.json`) with `num_experts` standardized

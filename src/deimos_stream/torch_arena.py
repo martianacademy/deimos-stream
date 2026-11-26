@@ -99,11 +99,14 @@ class TorchPagedExpertArena:
         self._dma_stream: Optional[torch.cuda.Stream] = (
             torch.cuda.Stream(device=self.device) if self.is_cuda else None
         )
+        self._layer_dma_done: List[Optional[torch.cuda.Event]] = [None] * self.num_layers
+        total_pool_bytes = self.num_layers * C * self.payload_bytes
+        use_pinned_host = self.is_cuda and (total_pool_bytes <= 4_500_000_000)
 
         for _ in range(self.num_layers):
             if self.is_cuda:
                 gw, gs, gb, dw, ds, db = _alloc_layer_set(self.device, pinned=False)
-                hw = _alloc_layer_set(torch.device("cpu"), pinned=True)
+                hw = _alloc_layer_set(torch.device("cpu"), pinned=use_pinned_host)
                 self._host_shadow.append(hw)
             else:
                 gw, gs, gb, dw, ds, db = _alloc_layer_set(torch.device("cpu"), pinned=False)
@@ -173,6 +176,10 @@ class TorchPagedExpertArena:
 
         hw = self._host_shadow[l_idx]
         assert self._dma_stream is not None
+        compute_stream = torch.cuda.current_stream(self.device)
+        # Device-side WAW/WAR fence: ensure prior compute kernels finished reading `gu_w[l_idx][ps]`
+        # before `_dma_stream` overwrites evicted physical slots!
+        self._dma_stream.wait_stream(compute_stream)
         with torch.cuda.stream(self._dma_stream):
             for ps in dirty:
                 self.gu_w[l_idx][ps].copy_(hw[0][ps], non_blocking=True)
@@ -182,7 +189,10 @@ class TorchPagedExpertArena:
                 self.dn_s[l_idx][ps].copy_(hw[4][ps], non_blocking=True)
                 self.dn_b[l_idx][ps].copy_(hw[5][ps], non_blocking=True)
                 gpu_gens[ps] = cpp_gens[ps]
-        torch.cuda.current_stream(self.device).wait_stream(self._dma_stream)
+            dma_ev = torch.cuda.Event()
+            dma_ev.record(self._dma_stream)
+            self._layer_dma_done[l_idx] = dma_ev
+        compute_stream.wait_stream(self._dma_stream)
 
     def resolve_and_prefetch(
         self,
@@ -209,6 +219,17 @@ class TorchPagedExpertArena:
             pred_c = np.ascontiguousarray(next_pred_ids_np.reshape(-1), dtype=np.int32)
             pred_ptr = pred_c.ctypes.data_as(ctypes.POINTER(ctypes.c_int32))
             pred_cnt = int(pred_c.size)
+
+        # Host-side DMA fence: ensure prior async H2D DMA from `_host_shadow[layer_idx]`
+        # (and `next_layer_idx` if lookahead targets it) completed before C++ `pread` overwrites host slots!
+        if self.is_cuda:
+            prev_ev = self._layer_dma_done[layer_idx]
+            if prev_ev is not None:
+                prev_ev.synchronize()
+            if 0 <= next_layer_idx < self.num_layers:
+                nxt_ev = self._layer_dma_done[next_layer_idx]
+                if nxt_ev is not None:
+                    nxt_ev.synchronize()
 
         rc = self.bridge.lib.deimos_arena_resolve_and_prefetch(
             self.arena_handle,
