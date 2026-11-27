@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Optional, Union
 
 from deimos_stream.engine import HAS_MLX, DeimosPagedMoEEngine
-from deimos_stream.fast_decode import apply_q4_backbone
+from deimos_stream.fast_decode import apply_q4_backbone, apply_q4_backbone_mlx_hybrid
 from deimos_stream.hf_streamer import DeimosHFHybridMoEEngine
 from deimos_stream.memory_budget import SlotPlan, SlotsArg, parse_slots_arg, plan_slots
 from deimos_stream.mlx_hybrid import DeimosMLXHybridMoEEngine
@@ -41,6 +41,10 @@ AnyDeimosEngine = Union[
 def resolve_backend(backend: str = "auto") -> Optional[str]:
     """Resolves `auto | mlx | cuda | cpu` to the active available execution backend."""
     b = backend.lower().strip()
+    if b == "mlx_hybrid":
+        b = "mlx"
+    elif b.startswith("hf_"):
+        b = b[3:]
     if b == "auto":
         if HAS_MLX:
             return "mlx"
@@ -119,17 +123,16 @@ def create_paged_moe_engine(
     eng: AnyDeimosEngine
     if is_hybrid:
         if resolved == "mlx":
-            eng = DeimosMLXHybridMoEEngine(**common)  # type: ignore[arg-type]
+            eng = DeimosMLXHybridMoEEngine(backbone=backbone, **common)  # type: ignore[arg-type]
+            if backbone == "q4":
+                apply_q4_backbone_mlx_hybrid(eng)
         else:
-            eng = DeimosHFHybridMoEEngine(device_str=resolved, **common)  # type: ignore[arg-type]
+            eng = DeimosHFHybridMoEEngine(device_str=resolved, backbone=backbone, **common)  # type: ignore[arg-type]
     elif resolved == "mlx":
         eng = DeimosPagedMoEEngine(**common)  # type: ignore[arg-type]
+        if backbone == "q4":
+            apply_q4_backbone(eng)
     else:
-        eng = TorchDeimosPagedMoEEngine(device_str=resolved, **common)  # type: ignore[arg-type]
-    if backbone == "q4":
-        if not isinstance(eng, DeimosPagedMoEEngine):
-            eng.close()
-            raise ValueError("--backbone q4 currently supports the MLX dense MoE engine (Apple Silicon) only.")
-        apply_q4_backbone(eng)
+        eng = TorchDeimosPagedMoEEngine(device_str=resolved, backbone=backbone, **common)  # type: ignore[arg-type]
     eng.slot_plan = plan  # type: ignore[union-attr]
     return eng

@@ -53,7 +53,7 @@ def create_deimos_app(
     miss_tail_tau: float = 0.85,
     enable_lookahead: bool = True,
     enable_merkle_kv: bool = True,
-    use_nocache_pread: bool = True,
+    use_nocache_pread: bool = False,
     verify_merkle_on_cold: bool = True,
     model_name: Optional[str] = None,
     max_memory_gb: Optional[float] = None,

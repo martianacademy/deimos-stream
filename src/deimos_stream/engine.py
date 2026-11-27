@@ -281,10 +281,11 @@ class DeimosPagedMoEEngine:
             if self._emb_gpu is None:
                 self._emb_gpu = mx.array(self.emb_np_view)
             h = self._emb_gpu[token_ids][None, :, :]
+            is_single_tok = int(token_ids.shape[0]) == 1
         else:
             h = mx.array(self.emb_np_view[list(token_ids)][None, :, :])
-        mask = create_attention_mask(h, caches[0] if caches is not None else None)
-        is_single_tok = len(token_ids) == 1
+            is_single_tok = len(token_ids) == 1
+        mask = None if is_single_tok else create_attention_mask(h, caches[0] if caches is not None else None)
         max_toks_per_chunk = max(1, self.arena.slots_per_layer // self.top_k)
 
         for l_idx in range(self.num_layers):
@@ -305,9 +306,9 @@ class DeimosPagedMoEEngine:
             if has_la:
                 la_norm = self.post_norms[l_idx + 1](h_post_attn).reshape(-1, D)
                 la_ind, _ = self.route_fn(la_norm @ self.routers[l_idx + 1].T)
-                mx.eval(x_flat, indices, scores, la_ind)
+                mx.eval(indices, scores, la_ind)
             else:
-                mx.eval(x_flat, indices, scores)
+                mx.eval(indices, scores)
 
             ind_np = np.asarray(indices, dtype=np.int32)
             sc_np = np.asarray(scores, dtype=np.float32)
@@ -349,8 +350,6 @@ class DeimosPagedMoEEngine:
                 h = h_post_attn + mx.concatenate(chunks_out, axis=0).reshape(B, L, D)
 
         h_out = self.final_norm(h if all_positions else h[:, -1:, :])
-        if not self.arena.is_fully_pinned:
-            mx.eval(h_out)
         logits = mx.quantized_matmul(
             h_out,
             self.lm_head_qw,

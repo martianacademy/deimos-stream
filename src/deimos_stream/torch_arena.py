@@ -1,21 +1,19 @@
 #!/usr/bin/env python3
 """
-DeimosStream PyTorch (`CUDA` / `CPU`) Paged Q4 Expert Arena (`src/deimos_stream/torch_arena.py`)
-===============================================================================================
-Implements fixed-VRAM 4-bit Expert Slot Pooling for discrete NVIDIA CUDA GPUs (and CPU CI):
-  - On `cuda`: Allocates ONE fixed Q4 slot pool in GPU HBM (`[C, out_dim, in_dim // 2]` `uint8` +
-    `float16` scales/biases) AND a page-locked (`pin_memory=True`) host staging shadow bound to
-    C++17 `DeimosArenaManager` (`F_NOCACHE` `pread` + SHA-256 Merkle proofs + Residual Lookahead).
-    Uses ABA-safe `deimos_arena_get_slot_gens` to stream ONLY newly staged slots over PCIe via
-    `non_blocking=True` DMA on a dedicated `torch.cuda.Stream`.
-  - On `cpu`: Binds CPU tensors directly to `DeimosArenaManager` with zero shadow memory overhead.
+DeimosStream PyTorch (`CUDA` / `CPU`) Hybrid Ring-Paged Q4 Expert Arena
+(`src/deimos_stream/torch_arena.py`)
+=======================================================================
+Implements fixed-VRAM 4-bit Expert Slot Pooling with zero full-pool host shadow:
+  - On `cuda`: Allocates ONE fixed Q4 slot pool in GPU HBM plus a shared 32-slot (`~58 MB`)
+    pinned staging ring buffer (eliminating multi-GiB `_host_shadow`).
+  - On `cpu`: Binds CPU tensors directly to `DeimosArenaManager` with zero shadow overhead.
 """
 
 from __future__ import annotations
 
 import ctypes
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import Callable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -25,7 +23,9 @@ from deimos_stream.arena import (
     DeimosMerkleIntegrityError,
     _CArenaTelemetry,
 )
+from deimos_stream.memory_budget import _linux_available_bytes, _linux_total_ram_bytes
 from deimos_stream.merkle_builder import compute_q4_leaf_layout
+from deimos_stream.torch_moe_exec import bind_hybrid_c_api, execute_torch_moe_layer
 
 try:
     import torch
@@ -35,23 +35,11 @@ except ImportError:
     torch = None  # type: ignore[assignment]
     HAS_TORCH = False
 
-
-def _available_host_ram_bytes() -> Optional[int]:
-    """Reads Linux `/proc/meminfo` `MemAvailable` to size `pin_memory=True` safely per host."""
-    p = Path("/proc/meminfo")
-    if not p.exists():
-        return None
-    try:
-        for line in p.read_text().splitlines():
-            if line.startswith("MemAvailable:"):
-                return int(line.split()[1]) * 1024
-    except Exception:
-        return None
-    return None
+RING_SLOTS: int = 32
 
 
 class TorchPagedExpertArena:
-    """Fixed-VRAM Q4 Expert Slot Pool for PyTorch `cuda` (pinned async PCIe DMA) and `cpu`."""
+    """Fixed-VRAM Q4 Expert Slot Pool for PyTorch `cuda` (ring DMA + hybrid SIMD) and `cpu`."""
 
     def __init__(
         self,
@@ -62,10 +50,13 @@ class TorchPagedExpertArena:
         use_nocache_pread: bool = False,
     ):
         if not HAS_TORCH:
-            raise RuntimeError("PyTorch is required for TorchPagedExpertArena (`pip install deimos-stream[cuda]`).")
+            raise RuntimeError("PyTorch is required (`pip install deimos-stream[cuda]`).")
+        bind_hybrid_c_api(bridge.lib)
         self.bridge: DeimosMerkleBridge = bridge
         self.device: torch.device = device
         self.is_cuda: bool = device.type == "cuda"
+        self.verify_merkle_on_cold: bool = bool(verify_merkle_on_cold)
+        self.use_nocache_pread: bool = bool(use_nocache_pread)
 
         h = bridge.header
         self.num_layers: int = int(h.num_layers)
@@ -75,11 +66,11 @@ class TorchPagedExpertArena:
         self.group_size: int = int(h.quant_group_size)
         self.slots_per_layer: int = max(1, min(self.num_experts, int(slots_per_layer)))
         self.is_fully_pinned: bool = self.slots_per_layer == self.num_experts
-        self.use_nocache_pread: bool = bool(use_nocache_pread)
 
         layout = compute_q4_leaf_layout(
             self.hidden_size, self.intermediate_size, group_size=self.group_size
         )
+        self._layout = layout
         self.payload_bytes: int = layout["payload_bytes"]
 
         C = self.slots_per_layer
@@ -89,15 +80,15 @@ class TorchPagedExpertArena:
         dn_half_in = self.intermediate_size // 2
         dn_groups = self.intermediate_size // self.group_size
 
-        def _alloc_layer_set(dev: torch.device, pinned: bool) -> Tuple[torch.Tensor, ...]:
+        def _alloc_set(n_slots: int, dev: torch.device, pinned: bool) -> Tuple[torch.Tensor, ...]:
             kw = {"device": dev, "pin_memory": pinned}
             return (
-                torch.zeros((C, gu_out, gu_half_in), dtype=torch.uint8, **kw),
-                torch.zeros((C, gu_out, gu_groups), dtype=torch.float16, **kw),
-                torch.zeros((C, gu_out, gu_groups), dtype=torch.float16, **kw),
-                torch.zeros((C, self.hidden_size, dn_half_in), dtype=torch.uint8, **kw),
-                torch.zeros((C, self.hidden_size, dn_groups), dtype=torch.float16, **kw),
-                torch.zeros((C, self.hidden_size, dn_groups), dtype=torch.float16, **kw),
+                torch.zeros((n_slots, gu_out, gu_half_in), dtype=torch.uint8, **kw),
+                torch.zeros((n_slots, gu_out, gu_groups), dtype=torch.float16, **kw),
+                torch.zeros((n_slots, gu_out, gu_groups), dtype=torch.float16, **kw),
+                torch.zeros((n_slots, self.hidden_size, dn_half_in), dtype=torch.uint8, **kw),
+                torch.zeros((n_slots, self.hidden_size, dn_groups), dtype=torch.float16, **kw),
+                torch.zeros((n_slots, self.hidden_size, dn_groups), dtype=torch.float16, **kw),
             )
 
         self.gu_w: List[torch.Tensor] = []
@@ -107,33 +98,45 @@ class TorchPagedExpertArena:
         self.dn_s: List[torch.Tensor] = []
         self.dn_b: List[torch.Tensor] = []
 
-        self._host_shadow: List[Tuple[torch.Tensor, ...]] = []
-        self._gpu_slot_gen: List[np.ndarray] = [
-            np.zeros((C,), dtype=np.uint64) for _ in range(self.num_layers)
-        ]
-        self._dma_stream: Optional[torch.cuda.Stream] = (
-            torch.cuda.Stream(device=self.device) if self.is_cuda else None
-        )
-        self._layer_dma_done: List[Optional[torch.cuda.Event]] = [None] * self.num_layers
-        total_pool_bytes = self.num_layers * C * self.payload_bytes
-        avail_ram = _available_host_ram_bytes()
-        pin_budget = int(avail_ram * 0.45) if avail_ram is not None else 4_500_000_000
-        use_pinned_host = self.is_cuda and (total_pool_bytes <= pin_budget)
-
         for _ in range(self.num_layers):
-            if self.is_cuda:
-                gw, gs, gb, dw, ds, db = _alloc_layer_set(self.device, pinned=False)
-                hw = _alloc_layer_set(torch.device("cpu"), pinned=use_pinned_host)
-                self._host_shadow.append(hw)
-            else:
-                gw, gs, gb, dw, ds, db = _alloc_layer_set(torch.device("cpu"), pinned=False)
-                self._host_shadow.append((gw, gs, gb, dw, ds, db))
+            gw, gs, gb, dw, ds, db = _alloc_set(C, self.device if self.is_cuda else torch.device("cpu"), False)
             self.gu_w.append(gw)
             self.gu_s.append(gs)
             self.gu_b.append(gb)
             self.dn_w.append(dw)
             self.dn_s.append(ds)
             self.dn_b.append(db)
+
+        self._dma_stream: Optional[torch.cuda.Stream] = (
+            torch.cuda.Stream(device=self.device) if self.is_cuda else None
+        )
+        self._ring_slots: int = min(RING_SLOTS, max(8, self.num_experts))
+        avail_ram = _linux_available_bytes()
+        total_ram = _linux_total_ram_bytes()
+        use_pin = self.is_cuda and (avail_ram is None or avail_ram > 256 * 1024 * 1024)
+        self._ring: Optional[Tuple[torch.Tensor, ...]] = (
+            _alloc_set(self._ring_slots, torch.device("cpu"), use_pin) if self.is_cuda else None
+        )
+        self._ring_events: List[Optional[torch.cuda.Event]] = [None] * self._ring_slots
+        self._ring_cursor: int = 0
+        self._layer_promo_ev: List[Optional[torch.cuda.Event]] = [None] * self.num_layers
+        self._evict_host_on_stage: bool = False
+        self._deferred_warm_range: Optional[Tuple[int, int]] = None
+
+        if self.is_cuda:
+            if torch.get_num_threads() > 2:
+                torch.set_num_threads(2)
+            pkw = {"device": "cpu", "pin_memory": True}
+            self._pin_x = torch.empty((1, self.hidden_size), dtype=torch.float16, **pkw)
+            self._pin_ids = torch.empty((64,), dtype=torch.int32, **pkw)
+            self._pin_sc = torch.empty((32,), dtype=torch.float32, **pkw)
+            self._pin_sc_f16 = torch.empty((32,), dtype=torch.float16, **pkw)
+            self._pin_cpu_out = torch.empty((1, self.hidden_size), dtype=torch.float16, **pkw)
+            self._pin_hit_slots = torch.empty((32,), dtype=torch.int32, **pkw)
+            self._pin_hit_sc = torch.empty((1, 32), dtype=torch.float16, **pkw)
+            self._gpu_hit_slots = torch.empty((32,), dtype=torch.int32, device=self.device)
+            self._gpu_hit_sc = torch.empty((1, 32), dtype=torch.float16, device=self.device)
+            self._gpu_cpu_out = torch.empty((1, self.hidden_size), dtype=torch.float16, device=self.device)
 
         self.arena_handle: Optional[int] = self.bridge.lib.deimos_arena_create(
             self.bridge.handle,
@@ -150,18 +153,18 @@ class TorchPagedExpertArena:
         if not self.arena_handle:
             raise RuntimeError("Failed to initialize C++17 DeimosArenaManager for PyTorch")
 
-        for l_idx in range(self.num_layers):
-            hw = self._host_shadow[l_idx]
-            self.bridge.lib.deimos_arena_bind_layer_ptrs(
-                self.arena_handle,
-                l_idx,
-                int(hw[0].data_ptr()),
-                int(hw[1].data_ptr()),
-                int(hw[2].data_ptr()),
-                int(hw[3].data_ptr()),
-                int(hw[4].data_ptr()),
-                int(hw[5].data_ptr()),
-            )
+        if not self.is_cuda:
+            for l_idx in range(self.num_layers):
+                self.bridge.lib.deimos_arena_bind_layer_ptrs(
+                    self.arena_handle,
+                    l_idx,
+                    int(self.gu_w[l_idx].data_ptr()),
+                    int(self.gu_s[l_idx].data_ptr()),
+                    int(self.gu_b[l_idx].data_ptr()),
+                    int(self.dn_w[l_idx].data_ptr()),
+                    int(self.dn_s[l_idx].data_ptr()),
+                    int(self.dn_b[l_idx].data_ptr()),
+                )
 
         if self.is_fully_pinned:
             rc = self.bridge.lib.deimos_arena_preload_all(self.arena_handle)
@@ -170,46 +173,135 @@ class TorchPagedExpertArena:
             if rc != 0:
                 raise RuntimeError(f"deimos_arena_preload_all failed (rc={rc})")
             if self.is_cuda:
+                all_ids = list(range(self.num_experts))
                 for l_idx in range(self.num_layers):
-                    self._sync_dirty_slots_to_cuda(l_idx, range(self.slots_per_layer))
+                    self._stage_via_ring(
+                        l_idx, all_ids, all_ids, wait_compute_first=False, block_compute_after=True, force_cached=True
+                    )
                 torch.cuda.synchronize(self.device)
-                # Free pinned host shadow once 100% pinned in CUDA HBM!
-                self._host_shadow.clear()
+                self._ring = None
+                self._ring_events = []
+        elif self.is_cuda and not self.use_nocache_pread and not self.verify_merkle_on_cold:
+            stride_b = int(self.bridge.header.expert_stride_bytes)
+            cas_total = self.num_layers * self.num_experts * stride_b
+            self._evict_host_on_stage = bool(total_ram is not None and total_ram < (cas_total + 6 * 1024**3))
+            warm_ids = list(range(self.slots_per_layer))
+            for l_idx in range(self.num_layers):
+                self._stage_via_ring(
+                    l_idx, warm_ids, warm_ids, wait_compute_first=False, block_compute_after=True, force_cached=True
+                )
+            torch.cuda.synchronize(self.device)
+            self._ring_events = [None] * self._ring_slots
+            self.bridge.lib.deimos_arena_mark_preloaded_prefix(self.arena_handle, self.slots_per_layer)
+            if self._evict_host_on_stage and total_ram is not None:
+                ram_b = max(0, total_ram - int(4.2 * 1024**3))
+                start_e = self.slots_per_layer
+                end_e = min(self.num_experts, start_e + (ram_b // max(1, self.num_layers * stride_b)))
+            else:
+                start_e, end_e = 0, self.num_experts
+            self._deferred_warm_range = (start_e, end_e)
 
-    def _sync_dirty_slots_to_cuda(self, l_idx: int, needed_slots: Sequence[int]) -> None:
-        if not self.is_cuda or not self._host_shadow:
+    def warm_host_cache(self) -> None:
+        """Prefaults non-GPU-resident CAS leaves into Host RAM & PTEs after backbone load completes."""
+        if self._deferred_warm_range is None:
             return
-        cpp_gens = np.empty((self.slots_per_layer,), dtype=np.uint64)
-        self.bridge.lib.deimos_arena_get_slot_gens(
-            self.arena_handle,
-            int(l_idx),
-            cpp_gens.ctypes.data_as(ctypes.POINTER(ctypes.c_uint64)),
-            self.slots_per_layer,
+        start_e, end_e = self._deferred_warm_range
+        self._deferred_warm_range = None
+        self.bridge.lib.deimos_warm_cpu_moe_pool(
+            self.bridge.handle, self.num_layers, int(start_e), int(end_e),
+            self.hidden_size, self.intermediate_size, self.group_size,
         )
-        gpu_gens = self._gpu_slot_gen[l_idx]
-        dirty = [int(s) for s in set(needed_slots) if gpu_gens[int(s)] != cpp_gens[int(s)]]
-        if not dirty:
-            return
 
-        hw = self._host_shadow[l_idx]
+    def _stage_via_ring(
+        self,
+        l_idx: int,
+        e_ids: Sequence[int],
+        dst_slots: Sequence[int],
+        wait_compute_first: bool,
+        block_compute_after: bool,
+        force_cached: bool = False,
+    ) -> None:
+        if not self.is_cuda or not e_ids or self._ring is None:
+            return
         assert self._dma_stream is not None
         compute_stream = torch.cuda.current_stream(self.device)
-        # Device-side WAW/WAR fence: ensure prior compute kernels finished reading `gu_w[l_idx][ps]`
-        # before `_dma_stream` overwrites evicted physical slots!
-        self._dma_stream.wait_stream(compute_stream)
-        with torch.cuda.stream(self._dma_stream):
-            for ps in dirty:
-                self.gu_w[l_idx][ps].copy_(hw[0][ps], non_blocking=True)
-                self.gu_s[l_idx][ps].copy_(hw[1][ps], non_blocking=True)
-                self.gu_b[l_idx][ps].copy_(hw[2][ps], non_blocking=True)
-                self.dn_w[l_idx][ps].copy_(hw[3][ps], non_blocking=True)
-                self.dn_s[l_idx][ps].copy_(hw[4][ps], non_blocking=True)
-                self.dn_b[l_idx][ps].copy_(hw[5][ps], non_blocking=True)
-                gpu_gens[ps] = cpp_gens[ps]
-            dma_ev = torch.cuda.Event()
-            dma_ev.record(self._dma_stream)
-            self._layer_dma_done[l_idx] = dma_ev
-        compute_stream.wait_stream(self._dma_stream)
+        if wait_compute_first:
+            self._dma_stream.wait_stream(compute_stream)
+
+        R = self._ring_slots
+        rg = self._ring
+        lay = self._layout
+        n_total = len(e_ids)
+        last_ev: Optional[torch.cuda.Event] = None
+
+        for c0 in range(0, n_total, R):
+            c1 = min(n_total, c0 + R)
+            cnt = c1 - c0
+            r_idxs = [(self._ring_cursor + i) % R for i in range(cnt)]
+            self._ring_cursor = (self._ring_cursor + cnt) % R
+
+            for r in r_idxs:
+                ev_old = self._ring_events[r]
+                if ev_old is not None:
+                    ev_old.synchronize()
+
+            e_arr = np.asarray(e_ids[c0:c1], dtype=np.int32)
+            r_arr = np.asarray(r_idxs, dtype=np.int32)
+            rc = self.bridge.lib.deimos_stage_q4_batch(
+                self.bridge.handle, int(l_idx),
+                e_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+                r_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+                int(cnt),
+                int(rg[0].data_ptr()), int(rg[1].data_ptr()), int(rg[2].data_ptr()),
+                int(rg[3].data_ptr()), int(rg[4].data_ptr()), int(rg[5].data_ptr()),
+                lay["gu_w_bytes"], lay["gu_s_bytes"], lay["dn_w_bytes"], lay["dn_s_bytes"],
+                1 if self.verify_merkle_on_cold else 0,
+                0 if force_cached else (1 if self.use_nocache_pread else 0),
+            )
+            if rc == -2:
+                raise DeimosMerkleIntegrityError(f"Corrupted Q4 Merkle leaf rejected in layer {l_idx}!")
+            if rc != 0:
+                raise RuntimeError(f"deimos_stage_q4_batch failed (rc={rc})")
+            if self._evict_host_on_stage:
+                for i in range(cnt):
+                    self.bridge.lib.deimos_evict_expert(self.bridge.handle, int(l_idx), int(e_arr[i]))
+
+            with torch.cuda.stream(self._dma_stream):
+                for i in range(cnt):
+                    r, ps = r_idxs[i], int(dst_slots[c0 + i])
+                    self.gu_w[l_idx][ps].copy_(rg[0][r], non_blocking=True)
+                    self.gu_s[l_idx][ps].copy_(rg[1][r], non_blocking=True)
+                    self.gu_b[l_idx][ps].copy_(rg[2][r], non_blocking=True)
+                    self.dn_w[l_idx][ps].copy_(rg[3][r], non_blocking=True)
+                    self.dn_s[l_idx][ps].copy_(rg[4][r], non_blocking=True)
+                    self.dn_b[l_idx][ps].copy_(rg[5][r], non_blocking=True)
+                ev = torch.cuda.Event()
+                ev.record(self._dma_stream)
+                for r in r_idxs:
+                    self._ring_events[r] = ev
+                last_ev = ev
+
+        if last_ev is not None:
+            if block_compute_after:
+                compute_stream.wait_event(last_ev)
+            else:
+                self._layer_promo_ev[l_idx] = last_ev
+
+    def forward_moe(
+        self,
+        layer_idx: int,
+        x_chunk: "torch.Tensor",
+        top_k_index: "torch.Tensor",
+        top_k_weights: "torch.Tensor",
+        miss_tail_tau: float = 1.0,
+        min_k: int = 4,
+        shared_fn: Optional[Callable[[], "torch.Tensor"]] = None,
+        la_ids_fn: Optional[Callable[[], "torch.Tensor"]] = None,
+    ) -> "torch.Tensor":
+        return execute_torch_moe_layer(
+            self, layer_idx, x_chunk, top_k_index, top_k_weights,
+            miss_tail_tau=miss_tail_tau, min_k=min_k, shared_fn=shared_fn, la_ids_fn=la_ids_fn,
+        )
 
     def resolve_and_prefetch(
         self,
@@ -225,60 +317,63 @@ class TorchPagedExpertArena:
         ids_c = np.ascontiguousarray(routed_ids_np, dtype=np.int32)
         sc_c = np.ascontiguousarray(routed_scores_np, dtype=np.float32)
 
+        if self.is_cuda:
+            promo_ev = self._layer_promo_ev[layer_idx]
+            if promo_ev is not None:
+                torch.cuda.current_stream(self.device).wait_event(promo_ev)
+                self._layer_promo_ev[layer_idx] = None
+            out_phys = np.empty((num_tokens, top_k), dtype=np.int32)
+            miss_e = np.empty((self.slots_per_layer,), dtype=np.int32)
+            miss_ps = np.empty((self.slots_per_layer,), dtype=np.int32)
+            n_miss = ctypes.c_int(0)
+            rc = self.bridge.lib.deimos_arena_resolve_ring_batch(
+                self.arena_handle, int(layer_idx),
+                ids_c.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+                sc_c.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                int(num_tokens), int(top_k),
+                out_phys.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+                miss_e.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+                miss_ps.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+                ctypes.byref(n_miss),
+            )
+            if rc != 0:
+                raise RuntimeError(f"deimos_arena_resolve_ring_batch failed (rc={rc})")
+            nm = int(n_miss.value)
+            if nm > 0:
+                self._stage_via_ring(
+                    int(layer_idx), miss_e[:nm].tolist(), miss_ps[:nm].tolist(),
+                    wait_compute_first=True, block_compute_after=True,
+                )
+            return out_phys, sc_c
+
         out_phys = np.empty((num_tokens, top_k), dtype=np.int32)
         out_sc = np.empty((num_tokens, top_k), dtype=np.float32)
         eff_k = ctypes.c_int(top_k)
-
-        pred_ptr = None
-        pred_cnt = 0
+        pred_ptr, pred_cnt = None, 0
         pred_c: Optional[np.ndarray] = None
         if next_layer_idx >= 0 and next_pred_ids_np is not None:
             pred_c = np.ascontiguousarray(next_pred_ids_np.reshape(-1), dtype=np.int32)
             pred_ptr = pred_c.ctypes.data_as(ctypes.POINTER(ctypes.c_int32))
             pred_cnt = int(pred_c.size)
 
-        # Host-side DMA fence: ensure prior async H2D DMA from `_host_shadow[layer_idx]`
-        # (and `next_layer_idx` if lookahead targets it) completed before C++ `pread` overwrites host slots!
-        if self.is_cuda:
-            prev_ev = self._layer_dma_done[layer_idx]
-            if prev_ev is not None:
-                prev_ev.synchronize()
-            if 0 <= next_layer_idx < self.num_layers:
-                nxt_ev = self._layer_dma_done[next_layer_idx]
-                if nxt_ev is not None:
-                    nxt_ev.synchronize()
-
         rc = self.bridge.lib.deimos_arena_resolve_and_prefetch(
-            self.arena_handle,
-            int(layer_idx),
+            self.arena_handle, int(layer_idx),
             ids_c.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
             sc_c.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-            int(num_tokens),
-            int(top_k),
-            float(miss_tail_tau),
-            int(min_k),
-            int(next_layer_idx),
-            pred_ptr,
-            pred_cnt,
+            int(num_tokens), int(top_k), float(miss_tail_tau), int(min_k),
+            int(next_layer_idx), pred_ptr, pred_cnt,
             out_phys.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
             out_sc.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
             ctypes.byref(eff_k),
         )
         if rc == -2:
-            raise DeimosMerkleIntegrityError(
-                f"Corrupted Q4 Merkle leaf rejected in layer {layer_idx}!"
-            )
+            raise DeimosMerkleIntegrityError(f"Corrupted Q4 Merkle leaf rejected in layer {layer_idx}!")
         if rc != 0:
             raise RuntimeError(f"deimos_arena_resolve_and_prefetch failed (rc={rc})")
-
         k_final = int(eff_k.value)
-        phys_res = out_phys[:, :k_final] if (k_final < top_k and num_tokens == 1) else out_phys
-        sc_res = out_sc[:, :k_final] if (k_final < top_k and num_tokens == 1) else out_sc
-
-        if self.is_cuda and not self.is_fully_pinned:
-            self._sync_dirty_slots_to_cuda(layer_idx, phys_res.reshape(-1).tolist())
-
-        return phys_res, sc_res
+        if k_final < top_k and num_tokens == 1:
+            return out_phys[:, :k_final], out_sc[:, :k_final]
+        return out_phys, out_sc
 
     def wait_idle(self) -> None:
         if self.arena_handle:
@@ -296,8 +391,7 @@ class TorchPagedExpertArena:
         a_st = _CArenaTelemetry()
         if self.arena_handle:
             self.bridge.lib.deimos_arena_get_telemetry(self.arena_handle, ctypes.byref(a_st))
-        hits = int(a_st.cache_hits)
-        misses = int(a_st.cache_misses)
+        hits, misses = int(a_st.cache_hits), int(a_st.cache_misses)
         tot = hits + misses
         skipped = int(a_st.tail_misses_skipped)
         eval_e = int(a_st.total_experts_evaluated)
@@ -325,7 +419,8 @@ class TorchPagedExpertArena:
         if self.arena_handle:
             self.bridge.lib.deimos_arena_destroy(self.arena_handle)
             self.arena_handle = None
-        self._host_shadow.clear()
+        self._ring = None
+        self._ring_events.clear()
         self.gu_w.clear()
         self.gu_s.clear()
         self.gu_b.clear()

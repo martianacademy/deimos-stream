@@ -21,6 +21,7 @@ import numpy as np
 from deimos_stream.backbone import _open_core_views
 from deimos_stream.torch_arena import HAS_TORCH
 from deimos_stream.torch_kv_cache import TorchKVCache
+from deimos_stream.triton_q4 import quantize_2d_q4_torch, triton_q4_dense_linear
 
 if HAS_TORCH:
     import torch
@@ -76,17 +77,33 @@ class TorchUniversalAttention:
         self.kv_dim = self.n_kv_heads * self.head_dim
         self.rms_eps = float(rms_eps)
         self.inv_freq = inv_freq
-        self.qkv_w = qkv_w
-        self.o_w = o_w
+        self.qkv_w: Optional["torch.Tensor"] = qkv_w
+        self.o_w: Optional["torch.Tensor"] = o_w
+        self.qkv_q4: Optional[Tuple["torch.Tensor", "torch.Tensor", "torch.Tensor"]] = None
+        self.o_q4: Optional[Tuple["torch.Tensor", "torch.Tensor", "torch.Tensor"]] = None
+        self.q_group_size: int = 64
         self.q_norm_w = q_norm_w
         self.k_norm_w = k_norm_w
         self.per_head = (
             q_norm_w is not None and int(q_norm_w.shape[-1]) == self.head_dim and self.n_heads > 1
         )
 
+    def quantize_weights(self, group_size: int = 64) -> None:
+        if self.qkv_w is not None and self.qkv_w.shape[-1] % group_size == 0:
+            self.qkv_q4 = quantize_2d_q4_torch(self.qkv_w, group_size=group_size)
+            self.qkv_w = None
+        if self.o_w is not None and self.o_w.shape[-1] % group_size == 0:
+            self.o_q4 = quantize_2d_q4_torch(self.o_w, group_size=group_size)
+            self.o_w = None
+        self.q_group_size = int(group_size)
+
     def __call__(self, x: "torch.Tensor", cache: Optional[TorchKVCache]) -> "torch.Tensor":
         B, L, _ = x.shape
-        qkv = x @ self.qkv_w.T
+        if self.qkv_q4 is not None:
+            qkv = triton_q4_dense_linear(x, *self.qkv_q4, group_size=self.q_group_size)
+        else:
+            assert self.qkv_w is not None
+            qkv = x @ self.qkv_w.T
         q, k, v = torch.split(qkv, [self.q_dim, self.kv_dim, self.kv_dim], dim=-1)
 
         if self.q_norm_w is not None and self.k_norm_w is not None and not self.per_head:
@@ -128,7 +145,11 @@ class TorchUniversalAttention:
         out = F.scaled_dot_product_attention(
             q, k_attn, v_attn, attn_mask=attn_mask, is_causal=is_causal
         )
-        return out.transpose(1, 2).contiguous().view(B, L, self.q_dim) @ self.o_w.T
+        out_flat = out.transpose(1, 2).contiguous().view(B, L, self.q_dim)
+        if self.o_q4 is not None:
+            return triton_q4_dense_linear(out_flat, *self.o_q4, group_size=self.q_group_size)
+        assert self.o_w is not None
+        return out_flat @ self.o_w.T
 
 
 def load_torch_backbone(

@@ -103,3 +103,21 @@ def apply_q4_backbone(eng: Any, group_size: int = 64) -> None:
     eng.backbone = "q4"
     del head
     mx.clear_cache()
+
+
+def apply_q4_backbone_mlx_hybrid(eng: Any, group_size: int = 64) -> None:
+    """Quantizes `DeimosMLXHybridMoEEngine` dense attention & shared_expert projections to Q4."""
+    import mlx.nn as nn
+
+    keep_fp16 = {"in_proj_a", "in_proj_b", "gate", "shared_expert_gate"}
+
+    def _pred(path: str, m: Any) -> bool:
+        leaf = path.rsplit(".", 1)[-1]
+        if leaf in keep_fp16 or not isinstance(m, nn.Linear):
+            return False
+        return int(m.weight.shape[-1]) % group_size == 0
+
+    nn.quantize(eng.model.model, group_size=group_size, bits=4, class_predicate=_pred)
+    mx.eval(eng.model.model.parameters())
+    eng.backbone = "q4"
+    mx.clear_cache()

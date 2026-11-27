@@ -40,7 +40,7 @@ class DeimosChatSession:
         miss_tail_tau: float = 0.85,
         enable_lookahead: bool = True,
         enable_merkle_kv: bool = True,
-        use_nocache_pread: bool = True,
+        use_nocache_pread: bool = False,
         verify_merkle_on_cold: bool = True,
         temperature: float = 0.0,
         max_memory_gb: Optional[float] = None,
@@ -321,12 +321,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p_chat.add_argument("--backend", type=str, default="auto", choices=["auto", "mlx", "cuda", "cpu"])
     p_chat.add_argument("--slots", type=parse_slots_arg, default="auto", help="Expert slots per layer: auto (pin all if memory allows, else fit free memory) or a number")
     p_chat.add_argument("--max-memory-gb", type=float, default=None, help="Cap the total memory budget for --slots auto")
-    p_chat.add_argument("--backbone", choices=["fp16", "q4"], default="fp16", help="q4: 4-bit attention + lm_head (faster, MLX dense only)")
+    p_chat.add_argument("--backbone", choices=["fp16", "q4"], default="fp16", help="q4: 4-bit dense projections + lm_head across MLX & CUDA")
     p_chat.add_argument("--tau", type=float, default=0.85, help="Miss-only Nucleus Dynamic-K tau")
     p_chat.add_argument("--no-lookahead", action="store_true")
     p_chat.add_argument("--no-kv-cache", action="store_true")
     p_chat.add_argument("--no-verify", action="store_true", help="Skip cold-load SHA-256 leaf verification on trusted local SSDs")
-    p_chat.add_argument("--mmap", action="store_true", help="Use OS mmap instead of F_NOCACHE pread")
+    p_chat.add_argument("--mmap", action="store_true", help="Use OS mmap page cache (default)")
+    p_chat.add_argument("--nocache", action="store_true", help="Bypass OS page cache via F_NOCACHE/O_DIRECT pread")
     p_chat.add_argument("--temp", type=float, default=0.0)
     p_chat.add_argument("--max-tokens", type=int, default=256)
     p_chat.add_argument("--prompt", type=str, default=None)
@@ -336,9 +337,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p_bench.add_argument("--backend", type=str, default="auto", choices=["auto", "mlx", "cuda", "cpu"])
     p_bench.add_argument("--slots", type=parse_slots_arg, default="auto", help="Expert slots per layer: auto (pin all if memory allows, else fit free memory) or a number")
     p_bench.add_argument("--max-memory-gb", type=float, default=None, help="Cap the total memory budget for --slots auto")
-    p_bench.add_argument("--backbone", choices=["fp16", "q4"], default="fp16", help="q4: 4-bit attention + lm_head (faster, MLX dense only)")
+    p_bench.add_argument("--backbone", choices=["fp16", "q4"], default="fp16", help="q4: 4-bit dense projections + lm_head across MLX & CUDA")
     p_bench.add_argument("--tau", type=float, default=0.85)
     p_bench.add_argument("--no-verify", action="store_true", help="Skip cold-load SHA-256 leaf verification")
+    p_bench.add_argument("--nocache", action="store_true", help="Bypass OS page cache via F_NOCACHE/O_DIRECT pread")
     p_bench.add_argument("--tokens", type=int, default=32)
     p_bench.add_argument(
         "--prompt",
@@ -358,12 +360,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p_srv.add_argument("--port", type=int, default=8080)
     p_srv.add_argument("--slots", type=parse_slots_arg, default="auto", help="Expert slots per layer: auto (pin all if memory allows, else fit free memory) or a number")
     p_srv.add_argument("--max-memory-gb", type=float, default=None, help="Cap the total memory budget for --slots auto")
-    p_srv.add_argument("--backbone", choices=["fp16", "q4"], default="fp16", help="q4: 4-bit attention + lm_head (faster, MLX dense only)")
+    p_srv.add_argument("--backbone", choices=["fp16", "q4"], default="fp16", help="q4: 4-bit dense projections + lm_head across MLX & CUDA")
     p_srv.add_argument("--tau", type=float, default=0.85, help="Miss-only Nucleus Dynamic-K tau")
     p_srv.add_argument("--no-lookahead", action="store_true")
     p_srv.add_argument("--no-kv-cache", action="store_true")
     p_srv.add_argument("--no-verify", action="store_true", help="Skip cold-load SHA-256 leaf verification")
-    p_srv.add_argument("--mmap", action="store_true", help="Use OS mmap instead of F_NOCACHE pread")
+    p_srv.add_argument("--mmap", action="store_true", help="Use OS mmap page cache (default)")
+    p_srv.add_argument("--nocache", action="store_true", help="Bypass OS page cache via F_NOCACHE/O_DIRECT pread")
     p_srv.add_argument("--model-name", type=str, default=None, help="Model ID exposed on /v1/models")
 
     args = parser.parse_args(argv)
@@ -396,7 +399,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             max_memory_gb=args.max_memory_gb,
             backbone=args.backbone,
             verify_merkle_on_cold=not args.no_verify,
-            use_nocache_pread=True,
+            use_nocache_pread=bool(args.nocache),
             enable_lookahead=True,
             miss_tail_tau=args.tau,
         )
@@ -429,7 +432,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             miss_tail_tau=args.tau,
             enable_lookahead=not args.no_lookahead,
             enable_merkle_kv=not args.no_kv_cache,
-            use_nocache_pread=not args.mmap,
+            use_nocache_pread=bool(args.nocache),
             verify_merkle_on_cold=not args.no_verify,
             model_name=args.model_name,
         )
@@ -450,7 +453,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             miss_tail_tau=args.tau,
             enable_lookahead=not args.no_lookahead,
             enable_merkle_kv=not args.no_kv_cache,
-            use_nocache_pread=not args.mmap,
+            use_nocache_pread=bool(args.nocache),
             verify_merkle_on_cold=not args.no_verify,
             temperature=args.temp,
         )

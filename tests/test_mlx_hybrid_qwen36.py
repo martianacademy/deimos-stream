@@ -131,6 +131,18 @@ class TestDeimosMLXHybridQwen36(unittest.TestCase):
 
                 m_pt = eng_pt.benchmark_token_ids(prompt_ids, max_new_tokens=8)
                 self.assertEqual(m_paged["generated_ids"], m_pt["generated_ids"])
+
+                eng_q4 = create_paged_moe_engine(
+                    store_dir, backend="mlx", slots_per_layer=12, backbone="q4", miss_tail_tau=1.0
+                )
+                try:
+                    self.assertEqual(eng_q4.backbone, "q4")  # type: ignore[attr-defined]
+                    l_q4 = np.asarray(eng_q4.forward_logits(prompt_ids).astype(mx.float32))
+                    self.assertGreater(
+                        float(np.corrcoef(l_pinned.ravel(), l_q4.ravel())[0, 1]), 0.98
+                    )
+                finally:
+                    eng_q4.close()
             finally:
                 eng_paged.close()
                 eng_pinned.close()

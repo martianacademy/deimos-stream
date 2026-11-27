@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -58,6 +59,7 @@ struct DeimosContext {
     uint8_t*           xor_tree = nullptr;
     DeimosExpertEntry* experts  = nullptr;
     DeimosKVSlot*      kv_table = nullptr;
+    std::unique_ptr<std::atomic<uint8_t>[]> verified_ram;
 
     std::atomic<uint64_t> xor_proofs{0};
     std::atomic<uint64_t> byte_proofs{0};
@@ -138,16 +140,14 @@ int verify_single_leaf_internal(
     const uint8_t* leaf_bytes_ptr,
     bool           verify_bytes
 ) {
-    DeimosExpertEntry& e = ctx->experts[slot];
+    const DeimosExpertEntry& e = ctx->experts[slot];
     uint8_t curr_hash[32];
 
     if (verify_bytes) {
-        if (!leaf_bytes_ptr) {
-            return DEIMOS_ERR_BOUNDS;
-        }
+        if (!leaf_bytes_ptr) return DEIMOS_ERR_BOUNDS;
         deimos_sha256_bytes(leaf_bytes_ptr, static_cast<size_t>(e.byte_length), curr_hash);
         if (std::memcmp(curr_hash, e.sha256, 32) != 0) {
-            e.flags &= ~DEIMOS_FLAG_VERIFIED;
+            if (ctx->verified_ram) ctx->verified_ram[slot].store(0u, std::memory_order_relaxed);
             return DEIMOS_ERR_MERKLE_CORRUPT;
         }
         ctx->byte_proofs.fetch_add(1, std::memory_order_relaxed);
@@ -157,25 +157,22 @@ int verify_single_leaf_internal(
 
     uint32_t node = ctx->header->tree_leaf_cap + slot;
     if (std::memcmp(ctx->xor_tree + (node * 32u), curr_hash, 32) != 0) {
-        e.flags &= ~DEIMOS_FLAG_VERIFIED;
+        if (ctx->verified_ram) ctx->verified_ram[slot].store(0u, std::memory_order_relaxed);
         return DEIMOS_ERR_MERKLE_CORRUPT;
     }
     while (node > 1u) {
         uint32_t sib = node ^ 1u;
         const uint8_t* sib_h = ctx->xor_tree + (sib * 32u);
-        if ((node & 1u) == 0u) {
-            sha256_pair_deimos(curr_hash, sib_h, curr_hash);
-        } else {
-            sha256_pair_deimos(sib_h, curr_hash, curr_hash);
-        }
+        if ((node & 1u) == 0u) sha256_pair_deimos(curr_hash, sib_h, curr_hash);
+        else sha256_pair_deimos(sib_h, curr_hash, curr_hash);
         node >>= 1u;
     }
     if (std::memcmp(curr_hash, ctx->header->expert_tree_root, 32) != 0) {
-        e.flags &= ~DEIMOS_FLAG_VERIFIED;
+        if (ctx->verified_ram) ctx->verified_ram[slot].store(0u, std::memory_order_relaxed);
         return DEIMOS_ERR_MERKLE_CORRUPT;
     }
-    if (verify_bytes) {
-        e.flags |= DEIMOS_FLAG_VERIFIED;
+    if (verify_bytes && ctx->verified_ram) {
+        ctx->verified_ram[slot].store(1u, std::memory_order_release);
     }
     ctx->xor_proofs.fetch_add(1, std::memory_order_relaxed);
     return DEIMOS_OK;
@@ -186,9 +183,7 @@ int verify_single_leaf_internal(
 extern "C" {
 
 void* deimos_open(const char* store_dir_cstr, const char* cas_filename_cstr, int enable_nocache_fd) {
-    if (!store_dir_cstr || !cas_filename_cstr) {
-        return nullptr;
-    }
+    if (!store_dir_cstr || !cas_filename_cstr) return nullptr;
     std::string dir(store_dir_cstr);
     std::string idx_path = dir + "/merkle_tree.idx";
     std::string cas_path = dir + "/" + std::string(cas_filename_cstr);
@@ -200,7 +195,6 @@ void* deimos_open(const char* store_dir_cstr, const char* cas_filename_cstr, int
         close(idx_fd);
         return nullptr;
     }
-
     int cas_fd = open(cas_path.c_str(), O_RDONLY);
     struct stat st_cas{};
     if (cas_fd >= 0) fstat(cas_fd, &st_cas);
@@ -211,7 +205,6 @@ void* deimos_open(const char* store_dir_cstr, const char* cas_filename_cstr, int
         if (cas_fd >= 0) close(cas_fd);
         return nullptr;
     }
-
     void* cas_map = (cas_fd >= 0 && st_cas.st_size > 0)
                         ? mmap(nullptr, st_cas.st_size, PROT_READ, MAP_PRIVATE, cas_fd, 0)
                         : MAP_FAILED;
@@ -231,13 +224,13 @@ void* deimos_open(const char* store_dir_cstr, const char* cas_filename_cstr, int
                         ? reinterpret_cast<DeimosKVSlot*>(ctx->idx_mmap + ctx->header->offset_kv_table)
                         : nullptr;
 
-    if (verify_tier1_dynamic(ctx) != DEIMOS_OK) {
-        delete ctx;
-        return nullptr;
+    if (verify_tier1_dynamic(ctx) != DEIMOS_OK) { delete ctx; return nullptr; }
+    const size_t total_exp = static_cast<size_t>(ctx->header->num_layers) * static_cast<size_t>(ctx->header->num_experts);
+    ctx->verified_ram = std::make_unique<std::atomic<uint8_t>[]>(total_exp);
+    for (size_t s = 0; s < total_exp; ++s) {
+        ctx->verified_ram[s].store((ctx->experts[s].flags & DEIMOS_FLAG_VERIFIED) ? 1u : 0u, std::memory_order_relaxed);
     }
-    if (ctx->cas_mmap) {
-        posix_madvise(ctx->cas_mmap, ctx->cas_size, POSIX_MADV_RANDOM);
-    }
+    if (ctx->cas_mmap) posix_madvise(ctx->cas_mmap, ctx->cas_size, POSIX_MADV_NORMAL);
     if (enable_nocache_fd && cas_fd >= 0) {
         int nc_fd = open(cas_path.c_str(), O_RDONLY);
         if (nc_fd >= 0) {
@@ -251,15 +244,12 @@ void* deimos_open(const char* store_dir_cstr, const char* cas_filename_cstr, int
 }
 
 void deimos_close(void* handle) {
-    if (handle) {
-        delete static_cast<DeimosContext*>(handle);
-    }
+    if (handle) delete static_cast<DeimosContext*>(handle);
 }
 
 int deimos_get_header(void* handle, DeimosHeader* out_header) {
     if (!handle || !out_header) return DEIMOS_ERR_INVALID_ARG;
-    auto* ctx = static_cast<DeimosContext*>(handle);
-    std::memcpy(out_header, ctx->header, sizeof(DeimosHeader));
+    std::memcpy(out_header, static_cast<DeimosContext*>(handle)->header, sizeof(DeimosHeader));
     return DEIMOS_OK;
 }
 
@@ -268,16 +258,12 @@ int deimos_verify_leaf(void* handle, int layer_idx, int expert_idx, int verify_b
     auto* ctx = static_cast<DeimosContext*>(handle);
     const int n_l = static_cast<int>(ctx->header->num_layers);
     const int n_e = static_cast<int>(ctx->header->num_experts);
-    if (layer_idx < 0 || layer_idx >= n_l || expert_idx < 0 || expert_idx >= n_e) {
-        return DEIMOS_ERR_INVALID_ARG;
-    }
+    if (layer_idx < 0 || layer_idx >= n_l || expert_idx < 0 || expert_idx >= n_e) return DEIMOS_ERR_INVALID_ARG;
     const uint32_t slot = static_cast<uint32_t>(layer_idx) * static_cast<uint32_t>(n_e) + static_cast<uint32_t>(expert_idx);
     const DeimosExpertEntry& e = ctx->experts[slot];
     const uint8_t* ptr = nullptr;
     if (verify_bytes) {
-        if (!ctx->cas_mmap || static_cast<size_t>(e.byte_offset) + static_cast<size_t>(e.byte_length) > ctx->cas_size) {
-            return DEIMOS_ERR_BOUNDS;
-        }
+        if (!ctx->cas_mmap || static_cast<size_t>(e.byte_offset) + static_cast<size_t>(e.byte_length) > ctx->cas_size) return DEIMOS_ERR_BOUNDS;
         ptr = ctx->cas_mmap + e.byte_offset;
     }
     return verify_single_leaf_internal(ctx, slot, ptr, verify_bytes != 0);
@@ -324,7 +310,7 @@ int deimos_stage_q4_batch(
             return DEIMOS_ERR_INVALID_ARG;
         }
         const uint32_t slot = static_cast<uint32_t>(layer_idx) * static_cast<uint32_t>(n_e) + static_cast<uint32_t>(e_idx);
-        DeimosExpertEntry& entry = ctx->experts[slot];
+        const DeimosExpertEntry& entry = ctx->experts[slot];
 
         if (static_cast<size_t>(entry.byte_offset) + static_cast<size_t>(entry.byte_length) > ctx->cas_size) {
             return DEIMOS_ERR_BOUNDS;
@@ -346,11 +332,9 @@ int deimos_stage_q4_batch(
             src = ctx->cas_mmap + entry.byte_offset;
         }
 
-        if (verify_on_cold && ((entry.flags & DEIMOS_FLAG_VERIFIED) == 0u)) {
+        if (verify_on_cold && ctx->verified_ram[slot].load(std::memory_order_acquire) == 0u) {
             int vrc = verify_single_leaf_internal(ctx, slot, src, true);
-            if (vrc != DEIMOS_OK) {
-                return vrc;
-            }
+            if (vrc != DEIMOS_OK) return vrc;
         }
 
         const size_t ps = static_cast<size_t>(p_slot);
@@ -362,14 +346,36 @@ int deimos_stage_q4_batch(
         std::memcpy(pool_dn_s + ps * dn_s_bytes, src + off, dn_s_bytes); off += dn_s_bytes;
         std::memcpy(pool_dn_b + ps * dn_s_bytes, src + off, dn_s_bytes);
 
-        uint64_t step = ctx->step_clock.fetch_add(1, std::memory_order_relaxed) + 1;
-        entry.access_freq += 1;
-        entry.last_step = step;
-
         ctx->dma_stages.fetch_add(1, std::memory_order_relaxed);
         ctx->dma_bytes.fetch_add(payload_req, std::memory_order_relaxed);
     }
     return DEIMOS_OK;
+}
+
+const uint8_t* deimos_get_expert_leaf_ptr(
+    void* handle, int layer_idx, int expert_idx, int verify_on_cold, int* out_rc
+) {
+    if (out_rc) *out_rc = DEIMOS_OK;
+    if (!handle) { if (out_rc) *out_rc = DEIMOS_ERR_INVALID_ARG; return nullptr; }
+    auto* ctx = static_cast<DeimosContext*>(handle);
+    const int n_l = static_cast<int>(ctx->header->num_layers);
+    const int n_e = static_cast<int>(ctx->header->num_experts);
+    if (layer_idx < 0 || layer_idx >= n_l || expert_idx < 0 || expert_idx >= n_e || !ctx->cas_mmap) {
+        if (out_rc) *out_rc = DEIMOS_ERR_BOUNDS;
+        return nullptr;
+    }
+    const uint32_t slot = static_cast<uint32_t>(layer_idx) * static_cast<uint32_t>(n_e) + static_cast<uint32_t>(expert_idx);
+    const DeimosExpertEntry& entry = ctx->experts[slot];
+    if (static_cast<size_t>(entry.byte_offset) + static_cast<size_t>(entry.byte_length) > ctx->cas_size) {
+        if (out_rc) *out_rc = DEIMOS_ERR_BOUNDS;
+        return nullptr;
+    }
+    const uint8_t* src = ctx->cas_mmap + entry.byte_offset;
+    if (verify_on_cold && ctx->verified_ram[slot].load(std::memory_order_acquire) == 0u) {
+        int vrc = verify_single_leaf_internal(ctx, slot, src, true);
+        if (vrc != DEIMOS_OK) { if (out_rc) *out_rc = vrc; return nullptr; }
+    }
+    return src;
 }
 
 int deimos_evict_expert(void* handle, int layer_idx, int expert_idx) {
@@ -382,7 +388,7 @@ int deimos_evict_expert(void* handle, int layer_idx, int expert_idx) {
     }
     const uint32_t slot = static_cast<uint32_t>(layer_idx) * static_cast<uint32_t>(n_e) + static_cast<uint32_t>(expert_idx);
     const DeimosExpertEntry& e = ctx->experts[slot];
-    posix_madvise(ctx->cas_mmap + e.byte_offset, e.byte_length, POSIX_MADV_DONTNEED);
+    madvise(ctx->cas_mmap + e.byte_offset, e.byte_length, MADV_DONTNEED);
     ctx->evictions.fetch_add(1, std::memory_order_relaxed);
     return DEIMOS_OK;
 }
