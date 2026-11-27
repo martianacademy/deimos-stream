@@ -132,6 +132,14 @@ int  deimos_evict_expert(void* handle, int layer_idx, int expert_idx);
 void deimos_prefetch_layer(void* handle, int layer_idx, const int32_t* expert_ids, int count);
 void deimos_get_stats(void* handle, DeimosStats* out_stats);
 
+const uint8_t* deimos_get_expert_leaf_ptr(
+    void* handle,
+    int   layer_idx,
+    int   expert_idx,
+    int   verify_on_cold,
+    int*  out_rc
+);
+
 int deimos_kv_lookup(void* handle, const uint8_t* prefix_hash32, double now_ts);
 int deimos_kv_insert(
     void*          handle,
@@ -185,6 +193,7 @@ int deimos_arena_bind_layer_ptrs(
 );
 
 int deimos_arena_preload_all(void* arena_handle);
+int deimos_arena_mark_preloaded_prefix(void* arena_handle, int count);
 
 int deimos_arena_resolve_and_prefetch(
     void*          arena_handle,
@@ -207,6 +216,63 @@ void deimos_arena_wait_idle(void* arena_handle);
 int  deimos_arena_get_slot_gens(void* arena_handle, int layer_idx, uint64_t* out_gens, int max_slots);
 void deimos_arena_get_telemetry(void* arena_handle, DeimosArenaTelemetry* out_tel);
 void deimos_arena_reset_telemetry(void* arena_handle);
+
+int deimos_arena_resolve_ring_batch(
+    void*          arena_handle,
+    int            layer_idx,
+    const int32_t* routed_ids,
+    const float*   routed_scores,
+    int            num_tokens,
+    int            top_k,
+    int32_t*       out_phys_slots,
+    int32_t*       out_miss_experts,
+    int32_t*       out_miss_phys_slots,
+    int*           out_num_misses
+);
+
+int deimos_arena_resolve_hybrid_decode(
+    void*          arena_handle,
+    int            layer_idx,
+    const int32_t* routed_ids,
+    const float*   routed_scores,
+    int            top_k,
+    float          miss_tail_tau,
+    int            min_k,
+    int            max_promos,
+    int32_t*       out_hit_phys_slots,
+    float*         out_hit_scores,
+    int*           out_num_hits,
+    int32_t*       out_miss_experts,
+    float*         out_miss_scores,
+    int*           out_num_misses,
+    int32_t*       out_promo_experts,
+    int32_t*       out_promo_phys_slots,
+    int*           out_num_promos
+);
+
+int deimos_cpu_q4_swiglu_forward(
+    void*          merkle_handle,
+    int            layer_idx,
+    const int32_t* expert_ids,
+    const float*   expert_scores,
+    int            num_experts_active,
+    const uint16_t* x_f16,
+    uint16_t*      out_f16,
+    int            hidden_size,
+    int            intermediate_size,
+    int            group_size,
+    int            verify_on_cold
+);
+
+void deimos_warm_cpu_moe_pool(
+    void* merkle_handle,
+    int   num_layers,
+    int   start_expert,
+    int   end_expert,
+    int   hidden_size,
+    int   intermediate_size,
+    int   group_size
+);
 
 #ifdef __cplusplus
 }

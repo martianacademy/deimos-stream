@@ -81,9 +81,13 @@ def sha256_pair_deimos(left32: bytes, right32: bytes) -> bytes:
 
 
 def compile_deimos_dylib(force: bool = False) -> Path:
-    """Compiles `deimos_merkle.mm` + `deimos_arena.mm` into `libdeimos_stream.dylib`."""
+    """Compiles native C++17 Merkle, UMA Arena, Hybrid Resolver, and SIMD Q4 MoE into `libdeimos_stream`."""
     src_merkle = NATIVE_DIR / "deimos_merkle.mm"
     src_arena = NATIVE_DIR / "deimos_arena.mm"
+    src_hybrid = NATIVE_DIR / "deimos_arena_hybrid.cpp"
+    src_cpu_moe = NATIVE_DIR / "deimos_cpu_moe.cpp"
+    hdr_internal = NATIVE_DIR / "deimos_arena_internal.h"
+    hdr_simd = NATIVE_DIR / "deimos_simd_q4.h"
     inc_dir = _resolve_include_dir()
     hdr_path = inc_dir / "deimos_stream.h"
     sha_hdr = inc_dir / "deimos_sha256.h"
@@ -92,6 +96,10 @@ def compile_deimos_dylib(force: bool = False) -> Path:
     newest_src = max(
         src_merkle.stat().st_mtime,
         src_arena.stat().st_mtime,
+        src_hybrid.stat().st_mtime,
+        src_cpu_moe.stat().st_mtime,
+        hdr_internal.stat().st_mtime,
+        hdr_simd.stat().st_mtime,
         hdr_path.stat().st_mtime,
         sha_hdr.stat().st_mtime if sha_hdr.exists() else 0.0,
     )
@@ -107,12 +115,18 @@ def compile_deimos_dylib(force: bool = False) -> Path:
             "-fPIC",
             "-I",
             str(inc_dir),
+            "-I",
+            str(NATIVE_DIR),
             "-x",
             "objective-c++",
-            "-framework",
-            "Foundation",
             str(src_merkle),
             str(src_arena),
+            "-x",
+            "c++",
+            str(src_hybrid),
+            str(src_cpu_moe),
+            "-framework",
+            "Foundation",
             "-o",
             str(dylib_path),
         ]
@@ -127,10 +141,14 @@ def compile_deimos_dylib(force: bool = False) -> Path:
             "-pthread",
             "-I",
             str(inc_dir),
+            "-I",
+            str(NATIVE_DIR),
             "-x",
             "c++",
             str(src_merkle),
             str(src_arena),
+            str(src_hybrid),
+            str(src_cpu_moe),
             "-o",
             str(dylib_path),
         ]

@@ -121,6 +121,17 @@ class TestFastDecode(unittest.TestCase):
             fp.close()
             q4.close()
 
+        eng_cpu_q4 = create_paged_moe_engine(
+            self.store, backend="cpu", slots_per_layer=8, miss_tail_tau=1.0,
+            enable_merkle_kv=False, backbone="q4",
+        )
+        try:
+            self.assertEqual(eng_cpu_q4.backbone, "q4")  # type: ignore[attr-defined]
+            m = eng_cpu_q4.benchmark_token_ids(PROMPT, max_new_tokens=6)
+            self.assertEqual(len(m["generated_ids"]), 7)
+        finally:
+            eng_cpu_q4.close()
+
     def test_5_sampling_path_runs(self) -> None:
         eng = self._eng()
         try:

@@ -86,39 +86,51 @@ class DeimosMLXMmapEmbedding(_NNModule):  # type: ignore[misc,valid-type]
 
 
 class DeimosMLXInt8LMHead(_NNModule):  # type: ignore[misc,valid-type]
-    """Vocab-tiled INT8 `lm_head` over `lm_head_int8.bin` matching PyTorch `DeimosInt8LMHead`."""
+    """Fused Metal `mx.quantized_matmul` `lm_head` (8-bit or 4-bit) over `lm_head_int8.bin`."""
 
     def __init__(
-        self, lm_path: Path, vocab_size: int, hidden_size: int, tile_vocab: int = 32768
+        self, lm_path: Path, vocab_size: int, hidden_size: int, bits: int = 8, group_size: int = 64
     ):
         super().__init__()
         w_nbytes = vocab_size * hidden_size
+        self.vocab_size = int(vocab_size)
+        self.bits = int(bits)
+        self.group_size = int(group_size)
+        qws, qss, qbs = [], [], []
         with open(lm_path, "rb") as f:
             mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
             try:
-                w_i8 = np.frombuffer(mm, dtype=np.int8, count=w_nbytes).reshape(
-                    vocab_size, hidden_size
-                ).copy()
-                s_f16 = np.frombuffer(
-                    mm, dtype=np.float16, count=vocab_size, offset=w_nbytes
-                ).reshape(vocab_size, 1).copy()
+                w_i8 = np.frombuffer(mm, dtype=np.int8, count=w_nbytes).reshape(vocab_size, hidden_size)
+                s_f16 = np.frombuffer(mm, dtype=np.float16, count=vocab_size, offset=w_nbytes).reshape(
+                    vocab_size, 1
+                )
+                for v0 in range(0, vocab_size, 32768):
+                    v1 = min(vocab_size, v0 + 32768)
+                    tile = mx.array(w_i8[v0:v1]).astype(mx.float16) * mx.array(s_f16[v0:v1])
+                    qw, qs, qb = mx.quantize(tile, group_size=self.group_size, bits=self.bits)
+                    mx.eval(qw, qs, qb)
+                    qws.append(qw)
+                    qss.append(qs)
+                    qbs.append(qb)
+                    del tile
+                del w_i8, s_f16
             finally:
                 mm.close()
-        self.w_i8 = mx.array(w_i8)
-        self.scale = mx.array(s_f16)
-        self.vocab_size = int(vocab_size)
-        self.tile_vocab = int(tile_vocab)
-        mx.eval(self.w_i8, self.scale)
+        self.qw = qws[0] if len(qws) == 1 else mx.concatenate(qws, axis=0)
+        self.qs = qss[0] if len(qss) == 1 else mx.concatenate(qss, axis=0)
+        self.qb = qbs[0] if len(qbs) == 1 else mx.concatenate(qbs, axis=0)
+        mx.eval(self.qw, self.qs, self.qb)
 
     def __call__(self, x: "mx.array") -> "mx.array":
-        orig_shape = x.shape[:-1]
-        x2 = x.reshape(-1, x.shape[-1]).astype(mx.float16)
-        tiles: List[mx.array] = []
-        for v0 in range(0, self.vocab_size, self.tile_vocab):
-            v1 = min(self.vocab_size, v0 + self.tile_vocab)
-            w_tile = self.w_i8[v0:v1].astype(mx.float16) * self.scale[v0:v1]
-            tiles.append(x2 @ w_tile.T)
-        return mx.concatenate(tiles, axis=-1).reshape(*orig_shape, self.vocab_size)
+        return mx.quantized_matmul(
+            x.astype(mx.float16),
+            self.qw,
+            self.qs,
+            self.qb,
+            transpose=True,
+            group_size=self.group_size,
+            bits=self.bits,
+        )
 
 
 class DeimosMLXPagedSparseMoeBlock(_NNModule):  # type: ignore[misc,valid-type]
@@ -153,10 +165,10 @@ class DeimosMLXPagedSparseMoeBlock(_NNModule):  # type: ignore[misc,valid-type]
         self.next_gate: Optional[Any] = None
 
     def _run_q4_chunk(
-        self, x_chunk: "mx.array", phys_np: np.ndarray, sc_chunk: "mx.array"
+        self, x_chunk: "mx.array", phys: Any, sc_chunk: "mx.array"
     ) -> "mx.array":
         l_i = self.layer_idx
-        phys_mx = mx.array(phys_np)
+        phys_mx = phys if isinstance(phys, mx.array) else mx.array(phys)
         x_exp = mx.expand_dims(x_chunk, (-2, -3))
         gu_out = mx.gather_qmm(
             x_exp,
@@ -201,8 +213,7 @@ class DeimosMLXPagedSparseMoeBlock(_NNModule):  # type: ignore[misc,valid-type]
         shared_y = mx.sigmoid(self.shared_expert_gate(x_flat)) * self.shared_expert(x_flat)
 
         if self.arena.is_fully_pinned:
-            mx.eval(inds, scores)
-            y = self._run_q4_chunk(x_flat, np.asarray(inds, dtype=np.int32), scores)
+            y = self._run_q4_chunk(x_flat, mx.stop_gradient(inds), scores)
             return (y + shared_y).reshape(B, L, D)
 
         is_single = N == 1
@@ -242,10 +253,7 @@ class DeimosMLXPagedSparseMoeBlock(_NNModule):  # type: ignore[misc,valid-type]
                 else mx.array(eff_sc_np).astype(x_flat.dtype)
             )
             y = self._run_q4_chunk(x_flat, phys_np, eff_sc)
-            out = (y + shared_y).reshape(B, L, D)
-            # Ensure Metal finishes reading unified arena[l] before any subsequent token evicts slots
-            mx.eval(out)
-            return out
+            return (y + shared_y).reshape(B, L, D)
 
         outs: List[mx.array] = []
         for s0 in range(0, N, max_chunk):
@@ -267,18 +275,20 @@ class DeimosMLXHybridMoEEngine:
         store_dir: Path,
         slots_per_layer: int = 16,
         verify_merkle_on_cold: bool = True,
-        use_nocache_pread: bool = True,
+        use_nocache_pread: bool = False,
         enable_lookahead: bool = True,
         enable_merkle_kv: bool = False,
         miss_tail_tau: float = 1.0,
         min_k: int = 4,
         top_k: Optional[int] = None,
+        backbone: str = "fp16",
     ):
         if not HAS_MLX:
             raise RuntimeError("Apple Silicon MLX (`mlx` + `mlx-lm`) required for DeimosMLXHybridMoEEngine.")
 
         self.store_dir = Path(store_dir).expanduser().resolve()
         self.backend_name: str = "mlx_hybrid"
+        self.backbone: str = backbone
         self.config: Dict[str, object] = json.loads((self.store_dir / "config.json").read_text())
         self.manifest: Dict[str, object] = json.loads(
             (self.store_dir / "merkle_manifest.json").read_text()
@@ -325,7 +335,10 @@ class DeimosMLXHybridMoEEngine:
         )
         model.model.embed_tokens = self._mmap_emb
         self._int8_head = DeimosMLXInt8LMHead(
-            self.store_dir / "lm_head_int8.bin", self.vocab_size, self.hidden_size
+            self.store_dir / "lm_head_int8.bin",
+            self.vocab_size,
+            self.hidden_size,
+            bits=4 if self.backbone == "q4" else 8,
         )
         model.lm_head = self._int8_head
 

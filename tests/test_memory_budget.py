@@ -93,10 +93,24 @@ class TestMemoryBudget(unittest.TestCase):
         self.assertEqual(p.slots_per_layer, 7)
 
     def test_6b_q4_backbone_shrinks_fixed_bytes(self) -> None:
-        # shared_core 10 MiB FP16 -> 10 * 4.5/16, lm_head 2 MiB INT8 -> 2 * 4.5/8
+        # shared_core / hf_backbone 10 MiB FP16 -> 10 * 4.5/16, lm_head 2 MiB INT8 -> 2 * 4.5/8
+        expected_fixed = int(10 * MIB * 4.5 / 16) + int(2 * MIB * 4.5 / 8)
         p = self._plan(40, backbone="q4")
-        self.assertEqual(p.fixed_bytes, int(10 * MIB * 4.5 / 16) + int(2 * MIB * 4.5 / 8))
+        self.assertEqual(p.fixed_bytes, expected_fixed)
         self.assertEqual(p.slots_per_layer, int((40 * MIB - p.fixed_bytes) // (4 * MIB)))
+
+        h = _fake_store(Path(self._tmp.name) / "hybrid_q4", hybrid=True)
+        ph = plan_slots(
+            h, "cuda", available_bytes=40 * MIB, memory_fraction=1.0, reserve_bytes=0, backbone="q4"
+        )
+        self.assertEqual(ph.fixed_bytes, int(10 * MIB * 7.5 / 16) + int(2 * MIB * 4.5 / 8))
+
+    def test_6c_cuda_ring_buffer_not_throttled_by_host_ram(self) -> None:
+        # CUDA TorchPagedExpertArena uses a fixed 32-slot (~58 MB) ring buffer instead of a full
+        # host shadow, so tight host RAM containers still get full GPU VRAM slot capacity.
+        p = plan_slots(self.store, "cuda", available_bytes=GIB, memory_fraction=1.0, reserve_bytes=0,
+                       host_available_bytes=2 * GIB)
+        self.assertEqual((p.slots_per_layer, p.host_limited), (16, False))
 
     def test_7_parse_slots_arg(self) -> None:
         self.assertEqual(parse_slots_arg("auto"), "auto")

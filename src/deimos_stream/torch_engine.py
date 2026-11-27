@@ -28,9 +28,11 @@ from deimos_stream.torch_arena import HAS_TORCH, TorchPagedExpertArena
 from deimos_stream.torch_backbone import load_torch_backbone, rms_norm
 from deimos_stream.torch_kv_cache import TorchKVCache, TorchMerkleKVPrefixCache
 from deimos_stream.triton_q4 import (
+    quantize_2d_q4_torch,
     run_paged_q4_swiglu,
     triton_int8_gemv,
     triton_kernels_available,
+    triton_q4_dense_linear,
 )
 
 if HAS_TORCH:
@@ -66,6 +68,7 @@ class TorchDeimosPagedMoEEngine:
         miss_tail_tau: float = 1.0,
         min_k: int = 4,
         top_k: Optional[int] = None,
+        backbone: str = "fp16",
     ):
         if not HAS_TORCH:
             raise RuntimeError("PyTorch not installed (`pip install 'deimos-stream[cuda]'`).")
@@ -74,7 +77,10 @@ class TorchDeimosPagedMoEEngine:
             raise FileNotFoundError(f"cas_experts_q4.bin not found in {self.store_dir}")
 
         self.device = torch.device(device_str)
+        if self.device.type == "cuda":
+            torch.set_num_threads(1)
         self.backend_name: str = self.device.type
+        self.backbone: str = backbone
         self.compute_dtype = torch.float16 if self.device.type == "cuda" else torch.float32
 
         self.config: Dict[str, object] = json.loads((self.store_dir / "config.json").read_text())
@@ -153,6 +159,25 @@ class TorchDeimosPagedMoEEngine:
             self.device,
             self.compute_dtype,
         )
+        self.lm_head_q4: Optional[Tuple["torch.Tensor", "torch.Tensor", "torch.Tensor"]] = None
+        if self.backbone == "q4" and self.hidden_size % 64 == 0:
+            for att in self.attns:
+                att.quantize_weights(64)
+            qws, qss, qbs = [], [], []
+            for v0 in range(0, self.vocab_size, 16384):
+                v1 = min(self.vocab_size, v0 + 16384)
+                chunk_f16 = self.lm_head_i8[v0:v1].to(torch.float16) * self.lm_head_scale[v0:v1].to(torch.float16)
+                qw, qs, qb = quantize_2d_q4_torch(chunk_f16, group_size=64)
+                qws.append(qw)
+                qss.append(qs)
+                qbs.append(qb)
+                del chunk_f16
+            self.lm_head_q4 = (torch.cat(qws, dim=0), torch.cat(qss, dim=0), torch.cat(qbs, dim=0))
+            self.lm_head_i8 = torch.empty((0, 0), dtype=torch.int8, device=self.device)
+            self.lm_head_scale = torch.empty((0, 0), dtype=self.compute_dtype, device=self.device)
+            if self.device.type == "cuda":
+                torch.cuda.empty_cache()
+        self.arena.warm_host_cache()
         self.reset_step_memory()
 
     def _route(self, router_logits: "torch.Tensor") -> Tuple["torch.Tensor", "torch.Tensor"]:
@@ -210,6 +235,30 @@ class TorchDeimosPagedMoEEngine:
             x_flat = normed_post.view(-1, D)
             indices, scores = self._route(x_flat @ self.routers[l_idx].T)
 
+            if self.arena.is_cuda:
+                sh = self.shared_mlps[l_idx]
+
+                def _sh_fn(sh_t=sh, xf=x_flat):  # type: ignore[no-untyped-def]
+                    if sh_t is None:
+                        return None
+                    sg, su, sd, sgate = sh_t
+                    sh_out = (F.silu(xf @ sg.T) * (xf @ su.T)) @ sd.T
+                    if sgate is not None:
+                        sh_out = sh_out * torch.sigmoid(xf @ sgate.T)
+                    return sh_out
+
+                y_moe = self.arena.forward_moe(
+                    l_idx,
+                    x_flat,
+                    indices,
+                    scores,
+                    miss_tail_tau=self.miss_tail_tau if is_single_tok else 1.0,
+                    min_k=self.min_k,
+                    shared_fn=_sh_fn if sh is not None else None,
+                )
+                h = h_post_attn + y_moe.view(B, L, D)
+                continue
+
             if self.arena.is_fully_pinned:
                 h = h_post_attn + self._gather_moe_q4(l_idx, x_flat, indices, scores).view(B, L, D)
                 continue
@@ -261,7 +310,9 @@ class TorchDeimosPagedMoEEngine:
         h_out = rms_norm(
             h if all_positions else h[:, -1:, :], self.final_norm, self.rms_eps
         )
-        if triton_kernels_available(self.device) and h_out.shape[1] <= 4:
+        if self.lm_head_q4 is not None:
+            logits = triton_q4_dense_linear(h_out, *self.lm_head_q4, group_size=64)
+        elif triton_kernels_available(self.device) and h_out.shape[1] <= 4:
             logits = triton_int8_gemv(
                 h_out.reshape(-1, self.hidden_size), self.lm_head_i8, self.lm_head_scale
             ).view(h_out.shape[0], h_out.shape[1], self.vocab_size)

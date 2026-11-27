@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "deimos-stream"
-version = "0.5.1"
+version = "0.6.0"
 description = "Universal Low-VRAM Sparse MoE & LLM Merkle-Paged Streaming Engine (MLX • CUDA • C++17)"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -31,6 +31,7 @@ classifiers = [
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: MIT License",
     "Operating System :: MacOS :: MacOS X",
+    "Operating System :: POSIX :: Linux",
     "Programming Language :: C++",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
@@ -70,6 +71,10 @@ deimos-stream = "deimos_stream.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/deimos_stream"]
+exclude = [
+    "src/deimos_stream/native/*.dylib",
+    "src/deimos_stream/native/*.so",
+]
 
 [tool.hatch.build.targets.wheel.force-include]
 "include/deimos_stream.h" = "deimos_stream/include/deimos_stream.h"

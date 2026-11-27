@@ -18,8 +18,8 @@ from __future__ import annotations
 import gc
 import inspect
 import json
-import math
 import mmap
+import os
 from pathlib import Path
 import time
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -29,11 +29,15 @@ import numpy as np
 from deimos_stream.arena import ArenaStats, DeimosMerkleBridge
 from deimos_stream.backbone import rss_mb
 from deimos_stream.engine import BenchmarkMetrics
+from deimos_stream.hf_cuda_graph import DeimosHFCudaGraphDecode, can_use_hf_cuda_graph
+from deimos_stream.hf_fast_patch import patch_hf_hybrid_for_cuda
 from deimos_stream.torch_arena import HAS_TORCH, TorchPagedExpertArena
 from deimos_stream.triton_q4 import (
+    quantize_2d_q4_torch,
     run_paged_q4_swiglu,
     triton_int8_gemv,
     triton_kernels_available,
+    triton_q4_dense_linear,
 )
 
 if HAS_TORCH:
@@ -91,7 +95,7 @@ class DeimosMmapEmbedding(_NNModule):  # type: ignore[misc,valid-type]
 
 
 class DeimosInt8LMHead(_NNModule):  # type: ignore[misc,valid-type]
-    """Vocab-tiled INT8 `lm_head` eliminating 970 MiB FP16 temporary dequantization spikes."""
+    """Vocab-tiled INT8/Q4 `lm_head` eliminating 970 MiB FP16 temporary dequantization spikes."""
 
     def __init__(
         self,
@@ -101,29 +105,49 @@ class DeimosInt8LMHead(_NNModule):  # type: ignore[misc,valid-type]
         device: "torch.device",
         dtype: "torch.dtype",
         tile_vocab: int = 32768,
+        use_q4: bool = False,
     ):
         super().__init__()
         w_nbytes = vocab_size * hidden_size
-        with open(lm_path, "rb") as f:
-            mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
-            try:
-                w_i8 = np.frombuffer(mm, dtype=np.int8, count=w_nbytes).reshape(
-                    vocab_size, hidden_size
-                ).copy()
-                s_f16 = np.frombuffer(mm, dtype=np.float16, count=vocab_size, offset=w_nbytes).reshape(
-                    vocab_size, 1
-                ).copy()
-            finally:
-                mm.close()
-        self.w_i8 = torch.from_numpy(w_i8).to(device)
-        self.scale = torch.from_numpy(s_f16).to(device=device, dtype=dtype)
         self.vocab_size = int(vocab_size)
         self.tile_vocab = int(tile_vocab)
         self.compute_dtype = dtype
+        self.q4: Optional[Tuple["torch.Tensor", "torch.Tensor", "torch.Tensor"]] = None
+
+        with open(lm_path, "rb") as f:
+            mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+            try:
+                w_i8 = np.frombuffer(mm, dtype=np.int8, count=w_nbytes).reshape(vocab_size, hidden_size)
+                s_f16 = np.frombuffer(mm, dtype=np.float16, count=vocab_size, offset=w_nbytes).reshape(
+                    vocab_size, 1
+                )
+                if use_q4 and hidden_size % 64 == 0:
+                    qws, qss, qbs = [], [], []
+                    for v0 in range(0, vocab_size, 16384):
+                        v1 = min(vocab_size, v0 + 16384)
+                        ch = torch.from_numpy(w_i8[v0:v1].copy()).to(device, torch.float16) * torch.from_numpy(
+                            s_f16[v0:v1].copy()
+                        ).to(device, torch.float16)
+                        qw, qs, qb = quantize_2d_q4_torch(ch, group_size=64)
+                        qws.append(qw)
+                        qss.append(qs)
+                        qbs.append(qb)
+                        del ch
+                    self.q4 = (torch.cat(qws, dim=0), torch.cat(qss, dim=0), torch.cat(qbs, dim=0))
+                    self.w_i8 = torch.empty((0, 0), dtype=torch.int8, device=device)
+                    self.scale = torch.empty((0, 0), dtype=dtype, device=device)
+                else:
+                    self.w_i8 = torch.from_numpy(w_i8.copy()).to(device)
+                    self.scale = torch.from_numpy(s_f16.copy()).to(device=device, dtype=dtype)
+                del w_i8, s_f16
+            finally:
+                mm.close()
 
     def forward(self, hidden_states: "torch.Tensor") -> "torch.Tensor":
         orig_shape = hidden_states.shape[:-1]
         x = hidden_states.reshape(-1, hidden_states.shape[-1]).to(self.compute_dtype)
+        if self.q4 is not None:
+            return triton_q4_dense_linear(x, *self.q4, group_size=64).reshape(*orig_shape, self.vocab_size)
         if triton_kernels_available(x.device) and x.shape[0] <= 4:
             return triton_int8_gemv(x, self.w_i8, self.scale).reshape(*orig_shape, self.vocab_size)
         out_tiles: List[torch.Tensor] = []
@@ -135,7 +159,7 @@ class DeimosInt8LMHead(_NNModule):  # type: ignore[misc,valid-type]
 
 
 class DeimosPagedHFExperts(_NNModule):  # type: ignore[misc,valid-type]
-    """Drop-in `DEIMIDX2` Paged Q4 replacement for `Qwen3_5MoeExperts` & HF MoE blocks."""
+    """Drop-in `DEIMIDX2` Hybrid Paged Q4 replacement for `Qwen3_5MoeExperts` & HF MoE blocks."""
 
     def __init__(
         self,
@@ -150,85 +174,62 @@ class DeimosPagedHFExperts(_NNModule):  # type: ignore[misc,valid-type]
         self.next_norm: Optional[nn.Module] = None
         self.next_gate: Optional[nn.Module] = None
 
-    def _run_q4_chunk(
-        self, x_chunk: "torch.Tensor", phys_np: np.ndarray, sc_chunk: "torch.Tensor"
-    ) -> "torch.Tensor":
-        flat_slots = torch.from_numpy(phys_np.reshape(-1)).to(device=x_chunk.device, dtype=torch.long)
-        l_i = self.layer_idx
-        return run_paged_q4_swiglu(
-            x_chunk,
-            self.arena.gu_w[l_i],
-            self.arena.gu_s[l_i],
-            self.arena.gu_b[l_i],
-            self.arena.dn_w[l_i],
-            self.arena.dn_s[l_i],
-            self.arena.dn_b[l_i],
-            flat_slots,
-            sc_chunk,
-            group_size=self.arena.group_size,
-        )
-
     def forward(
         self,
         hidden_states: "torch.Tensor",
         top_k_index: "torch.Tensor",
         top_k_weights: "torch.Tensor",
+        shared_fn: Optional[object] = None,
     ) -> "torch.Tensor":
-        N, _ = hidden_states.shape
-        top_k = int(top_k_index.shape[-1])
         eng = self.engine_ref
-
-        if self.arena.is_fully_pinned:
-            return self._run_q4_chunk(
-                hidden_states, top_k_index.detach().cpu().numpy().astype(np.int32), top_k_weights
-            )
-
-        is_single = N == 1
-        has_la = (
-            eng.enable_lookahead
-            and is_single
+        la_fn = None
+        if (
+            not self.arena.is_cuda
+            and eng.enable_lookahead
+            and hidden_states.shape[0] == 1
             and (self.layer_idx + 1 < eng.num_layers)
             and self.next_gate is not None
-        )
-        pred_np: Optional[np.ndarray] = None
-        if has_la:
-            with torch.no_grad():
+        ):
+            def _la() -> "torch.Tensor":
                 la_in = self.next_norm(hidden_states) if self.next_norm is not None else hidden_states
                 la_out = self.next_gate(la_in)  # type: ignore[misc]
-                la_sel = la_out[2] if isinstance(la_out, tuple) and len(la_out) >= 3 else la_out[0]
-                pred_np = la_sel.detach().cpu().numpy().astype(np.int32)
+                return la_out[2] if isinstance(la_out, tuple) and len(la_out) >= 3 else la_out[0]
+            la_fn = _la
 
-        ind_np = top_k_index.detach().cpu().numpy().astype(np.int32)
-        sc_np = top_k_weights.detach().float().cpu().numpy()
-        max_chunk = min(4, max(1, self.arena.slots_per_layer // max(1, top_k)))
+        return self.arena.forward_moe(
+            self.layer_idx,
+            hidden_states,
+            top_k_index,
+            top_k_weights,
+            miss_tail_tau=eng.miss_tail_tau,
+            min_k=eng.min_k,
+            shared_fn=shared_fn,  # type: ignore[arg-type]
+            la_ids_fn=la_fn,
+        )
 
-        if N <= max_chunk:
-            phys_np, eff_sc_np = self.arena.resolve_and_prefetch(
-                self.layer_idx,
-                ind_np,
-                sc_np,
-                miss_tail_tau=eng.miss_tail_tau if is_single else 1.0,
-                min_k=eng.min_k,
-                next_layer_idx=(self.layer_idx + 1) if has_la else -1,
-                next_pred_ids_np=pred_np,
-            )
-            eff_sc_t = (
-                top_k_weights
-                if (not is_single or eng.miss_tail_tau >= 0.9999)
-                else torch.from_numpy(eff_sc_np).to(
-                    device=hidden_states.device, dtype=hidden_states.dtype
-                )
-            )
-            return self._run_q4_chunk(hidden_states, phys_np, eff_sc_t)
 
-        outs: List[torch.Tensor] = []
-        for s0 in range(0, N, max_chunk):
-            s1 = min(N, s0 + max_chunk)
-            phys_np, _ = self.arena.resolve_and_prefetch(
-                self.layer_idx, ind_np[s0:s1], sc_np[s0:s1], miss_tail_tau=1.0
-            )
-            outs.append(self._run_q4_chunk(hidden_states[s0:s1], phys_np, top_k_weights[s0:s1]))
-        return torch.cat(outs, dim=0)
+def _bind_overlapped_moe_block(mlp_mod: "nn.Module", paged_exp: DeimosPagedHFExperts) -> None:
+    """Routes first, then overlaps GPU `shared_expert` + hit experts with CPU SIMD miss compute."""
+    if not (hasattr(mlp_mod, "gate") and hasattr(mlp_mod, "shared_expert") and hasattr(mlp_mod, "shared_expert_gate")):
+        return
+
+    def _fast_mlp_forward(hidden_states: "torch.Tensor") -> "torch.Tensor":
+        B, L, D = hidden_states.shape
+        x_flat = hidden_states.reshape(-1, D)
+        gate_out = mlp_mod.gate(x_flat)  # type: ignore[operator]
+        if isinstance(gate_out, tuple) and len(gate_out) >= 3:
+            _, routing_weights, selected_experts = gate_out[0], gate_out[1], gate_out[2]
+        else:
+            routing_weights, selected_experts = gate_out[0], gate_out[1]
+
+        def _run_shared() -> "torch.Tensor":
+            sh_y = mlp_mod.shared_expert(x_flat)  # type: ignore[operator]
+            return torch.sigmoid(mlp_mod.shared_expert_gate(x_flat)) * sh_y  # type: ignore[operator]
+
+        out = paged_exp(x_flat, selected_experts, routing_weights, shared_fn=_run_shared)
+        return out.reshape(B, L, D)
+
+    mlp_mod.forward = _fast_mlp_forward  # type: ignore[method-assign]
 
 
 class DeimosHFHybridMoEEngine:
@@ -246,6 +247,7 @@ class DeimosHFHybridMoEEngine:
         miss_tail_tau: float = 1.0,
         min_k: int = 4,
         top_k: Optional[int] = None,
+        backbone: str = "fp16",
     ):
         if not HAS_TORCH:
             raise RuntimeError("PyTorch & transformers required for DeimosHFHybridMoEEngine.")
@@ -253,7 +255,10 @@ class DeimosHFHybridMoEEngine:
 
         self.store_dir = Path(store_dir).expanduser().resolve()
         self.device = torch.device(device_str)
+        if self.device.type == "cuda":
+            torch.set_num_threads(1)
         self.backend_name: str = f"hf_{self.device.type}"
+        self.backbone: str = backbone
         self.compute_dtype = torch.float16 if self.device.type == "cuda" else torch.float32
 
         self.config: Dict[str, object] = json.loads((self.store_dir / "config.json").read_text())
@@ -272,19 +277,11 @@ class DeimosHFHybridMoEEngine:
         self.min_k = max(1, min(self.top_k, int(min_k)))
 
         tok_p = self.store_dir / "tokenizer.json"
-        self.tokenizer = (
-            Tokenizer.from_file(str(tok_p)) if (Tokenizer is not None and tok_p.exists()) else None
-        )
-
-        self.bridge = DeimosMerkleBridge(
-            self.store_dir, cas_filename="cas_experts_q4.bin", enable_nocache_fd=True
-        )
+        self.tokenizer = Tokenizer.from_file(str(tok_p)) if (Tokenizer is not None and tok_p.exists()) else None
+        self.bridge = DeimosMerkleBridge(self.store_dir, cas_filename="cas_experts_q4.bin", enable_nocache_fd=True)
         self.arena = TorchPagedExpertArena(
-            self.bridge,
-            device=self.device,
-            slots_per_layer=max(self.top_k, int(slots_per_layer)),
-            verify_merkle_on_cold=verify_merkle_on_cold,
-            use_nocache_pread=use_nocache_pread,
+            self.bridge, device=self.device, slots_per_layer=max(self.top_k, int(slots_per_layer)),
+            verify_merkle_on_cold=verify_merkle_on_cold, use_nocache_pread=use_nocache_pread,
         )
 
         hf_cfg = AutoConfig.from_pretrained(str(self.store_dir), trust_remote_code=True)
@@ -294,24 +291,15 @@ class DeimosHFHybridMoEEngine:
 
         with torch.device("meta"):
             model = AutoModelForCausalLM.from_config(text_cfg, trust_remote_code=True)
-        self._cache_kwarg = (
-            "cache" if "cache" in inspect.signature(model.forward).parameters else "past_key_values"
-        )
+        self._cache_kwarg = "cache" if "cache" in inspect.signature(model.forward).parameters else "past_key_values"
 
         self._mmap_emb = DeimosMmapEmbedding(
-            self.store_dir / "embed_tokens.bin",
-            self.vocab_size,
-            self.hidden_size,
-            self.device,
-            self.compute_dtype,
+            self.store_dir / "embed_tokens.bin", self.vocab_size, self.hidden_size, self.device, self.compute_dtype
         )
         model.model.embed_tokens = self._mmap_emb
         model.lm_head = DeimosInt8LMHead(
-            self.store_dir / "lm_head_int8.bin",
-            self.vocab_size,
-            self.hidden_size,
-            self.device,
-            self.compute_dtype,
+            self.store_dir / "lm_head_int8.bin", self.vocab_size, self.hidden_size,
+            self.device, self.compute_dtype, use_q4=False,
         )
         if hasattr(model.model, "rotary_emb"):
             rot_cls = type(model.model.rotary_emb)
@@ -321,14 +309,20 @@ class DeimosHFHybridMoEEngine:
         for l_i in range(self.num_layers):
             pmod = DeimosPagedHFExperts(l_i, self.arena, self)
             model.model.layers[l_i].mlp.experts = pmod
+            _bind_overlapped_moe_block(model.model.layers[l_i].mlp, pmod)
             paged_mods.append(pmod)
 
-        bb_tensors = st_load_torch(str(self.store_dir / "hf_backbone.safetensors"), device="cpu")
-        casted_bb = {
-            k: (v.to(device=self.device, dtype=self.compute_dtype) if v.is_floating_point() and v.dtype != torch.float32 else v.to(device=self.device))
-            for k, v in bb_tensors.items()
-        }
-        bb_tensors.clear()
+        bb_path = self.store_dir / "hf_backbone.safetensors"
+        bb_tensors = st_load_torch(str(bb_path), device="cpu")
+        load_dev = torch.device("cpu") if (self.backbone == "q4" and self.device.type == "cuda") else self.device
+        casted_bb = {}
+        for k in list(bb_tensors.keys()):
+            v = bb_tensors.pop(k)
+            casted_bb[k] = (
+                v.to(device=load_dev, dtype=self.compute_dtype)
+                if v.is_floating_point() and v.dtype != torch.float32
+                else v.to(device=load_dev)
+            )
         model.load_state_dict(casted_bb, strict=False, assign=True)
         casted_bb.clear()
         gc.collect()
@@ -338,8 +332,21 @@ class DeimosHFHybridMoEEngine:
             paged_mods[l_i].next_norm = getattr(nxt, "post_attention_layernorm", None)
             paged_mods[l_i].next_gate = nxt.mlp.gate
 
+        patch_hf_hybrid_for_cuda(model, self.device, backbone=self.backbone)
+        if self.arena._evict_host_on_stage and hasattr(os, "posix_fadvise") and hasattr(os, "POSIX_FADV_DONTNEED"):
+            for fp in (bb_path, self.store_dir / "lm_head_int8.bin"):
+                fd = os.open(fp, os.O_RDONLY)
+                try:
+                    os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                finally:
+                    os.close(fd)
         model.eval()
         self.model = model
+        self.use_cuda_graph: bool = True
+        self._graph_runner: Optional[DeimosHFCudaGraphDecode] = (
+            DeimosHFCudaGraphDecode(self) if can_use_hf_cuda_graph(self) else None
+        )
+        self.arena.warm_host_cache()
         self.reset_step_memory()
 
     def make_caches(self) -> List[Optional[object]]:
@@ -372,8 +379,18 @@ class DeimosHFHybridMoEEngine:
         caches: Optional[List[Optional[object]]] = None,
         all_positions: bool = False,
     ) -> "torch.Tensor":
-        inp = torch.tensor([list(token_ids)], dtype=torch.long, device=self.device)
         past = caches[0] if (caches is not None and len(caches) > 0) else None
+        if (
+            self.use_cuda_graph
+            and self._graph_runner is not None
+            and not all_positions
+            and len(token_ids) == 1
+            and past is not None
+        ):
+            g_logits = self._graph_runner.step(int(token_ids[0]), past)
+            if g_logits is not None:
+                return g_logits
+        inp = torch.tensor([list(token_ids)], dtype=torch.long, device=self.device)
         out = self.model(
             input_ids=inp,
             use_cache=(caches is not None),
@@ -388,7 +405,10 @@ class DeimosHFHybridMoEEngine:
     def prefill_prompt(
         self, prompt_ids: Sequence[int], caches: List[Optional[object]]
     ) -> Tuple["torch.Tensor", int]:
-        return self.forward_logits(prompt_ids, caches=caches), 0
+        logits = self.forward_logits(prompt_ids, caches=caches)
+        if self.use_cuda_graph and self._graph_runner is not None and caches and caches[0] is not None:
+            self._graph_runner._sync_from_hf_cache(caches[0])
+        return logits, 0
 
     @_inference_mode()
     def benchmark_token_ids(
@@ -454,6 +474,9 @@ class DeimosHFHybridMoEEngine:
         )
 
     def close(self) -> None:
+        if self._graph_runner is not None:
+            self._graph_runner.close()
+            self._graph_runner = None
         self.arena.close()
         self._mmap_emb.close()
         del self.model
