@@ -350,8 +350,12 @@ class DeimosHFCudaGraphDecode:
 
 
 def can_use_hf_cuda_graph(eng: "DeimosHFHybridMoEEngine") -> bool:
+    mtype = str(eng.config.get("model_type", "")).lower()
+    moe_ids = getattr(eng, "moe_layer_ids", list(range(eng.num_layers)))
     return bool(
         torch is not None
+        and mtype in {"qwen3_5_moe", "qwen3_5", "qwen3_5_moe_text", "qwen3_5_text"}
+        and len(moe_ids) == eng.num_layers
         and eng.device.type == "cuda"
         and hybrid_triton_available(eng.device)
         and not eng.arena.use_nocache_pread

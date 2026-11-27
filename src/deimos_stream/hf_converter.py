@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """
-DeimosStream HuggingFace Hybrid-MoE -> `DEIMIDX2` Q4 Converter (`src/deimos_stream/hf_converter.py`)
-====================================================================================================
-Converts modern 2026 HuggingFace Hybrid & Multimodal Sparse MoE checkpoints (such as
-`Qwen/Qwen3.6-35B-A3B`, `Qwen/Qwen3.5-35B-A3B`, `Qwen/Qwen3-Next-80B-A3B-Instruct`, and
-any `AutoModelForCausalLM` with 3D `gate_up_proj`/`down_proj` or 2D per-expert weights) into:
+DeimosStream HuggingFace Universal Sparse & Hybrid-MoE -> `DEIMIDX2` Q4 Converter
+(`src/deimos_stream/hf_converter.py`)
+=================================================================================
+Converts modern 2025–2026 HuggingFace Sparse, Hybrid & Multimodal MoE checkpoints
+(`Qwen3.6 / 3.5 / Next`, `Qwen2/3-MoE`, `DeepSeek-V2 / V3 / R1 / V3.2`, `Kimi-K2 / Moonlight`,
+`GLM-4.5`, `Llama-4 Scout / Maverick`, `Mixtral`, `OLMoE`, `MiniMax-M2`, `ERNIE-4.5`, `Jamba`) into:
   - `cas_experts_q4.bin` + `merkle_tree.idx` (`DEIMIDX2` 16 KB page-aligned Q4 Merkle leaves)
-  - `hf_backbone.safetensors` (FP16 non-expert text layers, stripping vision/MTP overhead)
+  - `hf_backbone.safetensors` (FP16 non-expert text layers + dense `first_k_dense_replace` layers)
   - `embed_tokens.bin` (zero-VRAM `mmap` FP16 row table)
   - `lm_head_int8.bin` (tiled INT8 output head saving ~50% head VRAM + ~840 MiB temp spikes)
 
-Supports reference-counted shard streaming from HuggingFace Hub (`delete_downloaded_shards=True`)
-so 67+ GiB checkpoints convert cleanly inside small cloud `/tmp` disks with GPU-accelerated Q4!
+Automatically dequantizes block-scaled `FP8` (`weight_scale_inv`) shards, handles mixed
+dense + MoE layer schedules (`moe_layer_ids`), transposes `Llama-4` `[E, D, 2I]` experts,
+and deletes downloaded shards via reference counting (`delete_downloaded_shards=True`).
 """
 
 from __future__ import annotations
@@ -21,7 +23,6 @@ import gc
 import hashlib
 import json
 from pathlib import Path
-import re
 import shutil
 import sys
 import time
@@ -35,6 +36,15 @@ from deimos_stream.merkle_builder import (
     compile_deimos_dylib,
     compute_q4_leaf_layout,
 )
+from deimos_stream.model_adapters import (
+    canonicalize_hf_key,
+    detect_lm_prefix,
+    discover_hf_moe_layers,
+    extract_layer_experts_gu_dn,
+    is_ignored_checkpoint_key,
+    pop_tensor_dequant,
+    validate_convertible_architecture,
+)
 from deimos_stream.torch_arena import HAS_TORCH
 
 if HAS_TORCH:
@@ -47,10 +57,7 @@ else:
 def quantize_torch_to_q4_bytes(
     weight_t: "torch.Tensor", group_size: int = 64
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    GPU-accelerated 4-bit affine group-64 quantizer producing exact `DEIMIDX2` / MLX layout:
-      `(qw_u32, scales_f16, biases_f16)` on CPU NumPy.
-    """
+    """GPU-accelerated 4-bit affine group-64 quantizer producing `(qw_u32, scales_f16, biases_f16)`."""
     orig_shape = tuple(weight_t.shape)
     w_f32 = weight_t.to(torch.float32)
     grouped = w_f32.reshape(*orig_shape[:-1], orig_shape[-1] // group_size, group_size)
@@ -104,9 +111,7 @@ class _RefCountedShardFetcher:
             from huggingface_hub import hf_hub_download
 
             dl = hf_hub_download(
-                repo_id=self.repo_id,
-                filename=shard_name,
-                local_dir=str(self.cache_dir),
+                repo_id=self.repo_id, filename=shard_name, local_dir=str(self.cache_dir)
             )
             self._shard_paths[shard_name] = Path(dl)
         return self._shard_paths[shard_name]
@@ -126,7 +131,9 @@ class _RefCountedShardFetcher:
         return t
 
 
-def _fetch_metadata_files(repo_or_dir: str, out_dir: Path, tmp_dir: Path) -> Tuple[Dict[str, object], Dict[str, str], int]:
+def _fetch_metadata_files(
+    repo_or_dir: str, out_dir: Path, tmp_dir: Path
+) -> Tuple[Dict[str, object], Dict[str, str], int]:
     p = Path(repo_or_dir).expanduser()
     meta_files = (
         "config.json",
@@ -138,29 +145,38 @@ def _fetch_metadata_files(repo_or_dir: str, out_dir: Path, tmp_dir: Path) -> Tup
         "merges.txt",
     )
     if p.exists():
-        src = p.resolve()
-        for mf in meta_files:
-            if (src / mf).exists():
-                shutil.copy2(src / mf, out_dir / mf)
-        raw_cfg = json.loads((src / "config.json").read_text())
-        idx_p = src / "model.safetensors.index.json"
+        src_dir = p.resolve()
+        for fn in meta_files:
+            if (src_dir / fn).exists():
+                shutil.copy2(src_dir / fn, out_dir / fn)
+        raw_cfg = json.loads((src_dir / "config.json").read_text())
+        idx_p = src_dir / "model.safetensors.index.json"
         if idx_p.exists():
             idx_d = json.loads(idx_p.read_text())
-            tot_b = int(idx_d.get("metadata", {}).get("total_size", 0))
-            return raw_cfg, dict(idx_d["weight_map"]), tot_b
-        single = src / "model.safetensors"
-        with safe_open(str(single), framework="pt", device="cpu") as sf:
-            wm = {k: "model.safetensors" for k in sf.keys()}
-        return raw_cfg, wm, single.stat().st_size
+            wm = dict(idx_d["weight_map"])
+            tot_b = sum((src_dir / s).stat().st_size for s in set(wm.values()) if (src_dir / s).exists())
+            return raw_cfg, wm, tot_b
+        shards = sorted(src_dir.glob("*.safetensors"))
+        if not shards:
+            raise FileNotFoundError(f"No .safetensors files found in {src_dir}")
+        wm = {}
+        tot_b = 0
+        for sp in shards:
+            tot_b += sp.stat().st_size
+            with safe_open(str(sp), framework="pt", device="cpu") as sf:
+                for k in sf.keys():
+                    wm[k] = sp.name
+        return raw_cfg, wm, tot_b
 
     from huggingface_hub import hf_hub_download
 
+    tmp_dir.mkdir(parents=True, exist_ok=True)
     cfg_path = Path(hf_hub_download(repo_id=repo_or_dir, filename="config.json", local_dir=str(tmp_dir)))
     shutil.copy2(cfg_path, out_dir / "config.json")
-    for mf in meta_files[1:]:
+    for fn in meta_files[1:]:
         try:
-            mp = Path(hf_hub_download(repo_id=repo_or_dir, filename=mf, local_dir=str(tmp_dir)))
-            shutil.copy2(mp, out_dir / mf)
+            fp = Path(hf_hub_download(repo_id=repo_or_dir, filename=fn, local_dir=str(tmp_dir)))
+            shutil.copy2(fp, out_dir / fn)
         except Exception:
             pass
     raw_cfg = json.loads(cfg_path.read_text())
@@ -180,16 +196,21 @@ def _fetch_metadata_files(repo_or_dir: str, out_dir: Path, tmp_dir: Path) -> Tup
         return raw_cfg, wm, sp.stat().st_size
 
 
+def _cast_backbone_tensor(key: str, t_cpu: "torch.Tensor") -> "torch.Tensor":
+    """Casts BF16 backbone weights to FP16 while preserving genuine FP32 buffers/norms/biases."""
+    del key
+    if t_cpu.dtype == torch.bfloat16:
+        return t_cpu.to(torch.float16).contiguous()
+    return t_cpu.contiguous()
+
+
 def convert_hf_hybrid_moe_to_deimos(
     repo_id_or_dir: str,
     output_store_dir: Path,
     group_size: int = 64,
     delete_downloaded_shards: bool = True,
 ) -> Path:
-    """
-    Converts any HuggingFace Hybrid/Multimodal Sparse MoE (e.g. `Qwen/Qwen3.6-35B-A3B`)
-    into a `DEIMIDX2` Q4 Merkle Store ready for `DeimosHFHybridMoEEngine`.
-    """
+    """Converts any supported HuggingFace Sparse/Hybrid/Multimodal MoE into a `DEIMIDX2` Q4 store."""
     if not HAS_TORCH:
         raise RuntimeError("PyTorch is required for convert_hf_hybrid_moe_to_deimos.")
     t0 = time.perf_counter()
@@ -199,39 +220,55 @@ def convert_hf_hybrid_moe_to_deimos(
     compile_deimos_dylib(force=False)
 
     raw_cfg, weight_map, orig_bytes = _fetch_metadata_files(repo_id_or_dir, out_dir, tmp_dl)
+    validate_convertible_architecture(raw_cfg)
     t_cfg = dict(raw_cfg.get("text_config", raw_cfg))  # type: ignore[arg-type]
 
     num_layers = int(t_cfg["num_hidden_layers"])
     hidden_size = int(t_cfg["hidden_size"])
-    inter_size = int(t_cfg.get("moe_intermediate_size") or t_cfg["intermediate_size"])
+    inter_size = int(
+        t_cfg.get("moe_intermediate_size") or t_cfg.get("ffn_hidden_size") or t_cfg["intermediate_size"]
+    )
     num_experts = int(
         t_cfg.get("num_experts") or t_cfg.get("num_local_experts") or t_cfg["n_routed_experts"]
     )
     vocab_size = int(t_cfg["vocab_size"])
     q_dev = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # Classify checkpoint keys (ignoring vision tower & MTP heads)
-    ignore_re = re.compile(r"^(model\.visual\.|visual\.|mtp\.)")
-    active_keys = {k for k in weight_map if not ignore_re.match(k)}
-    has_lm_prefix = any(k.startswith("model.language_model.") for k in active_keys)
-    lp_root = "model.language_model" if has_lm_prefix else "model"
+    active_keys = {k for k in weight_map if not is_ignored_checkpoint_key(k, num_layers)}
+    lp_root = detect_lm_prefix(active_keys)
+    moe_specs = discover_hf_moe_layers(num_layers, lp_root, active_keys)
+    if not moe_specs:
+        raise ValueError(f"No routed MoE expert tensors discovered in {repo_id_or_dir!r}.")
+    moe_map: Dict[int, str] = dict(moe_specs)
+    moe_layer_ids = [l_i for l_i, _ in moe_specs]
+    moe_containers = [attr for _, attr in moe_specs]
+    num_moe_layers = len(moe_layer_ids)
 
     fetcher = _RefCountedShardFetcher(
         repo_id_or_dir, tmp_dl, active_keys, weight_map, delete_shards=delete_downloaded_shards
     )
+    used_special: Set[str] = set()
 
-    # 1. Extract `embed_tokens.bin` + `lm_head_int8.bin`
-    emb_key = f"{lp_root}.embed_tokens.weight"
-    emb_t = fetcher.pop_tensor(emb_key, device="cpu").to(torch.float16).contiguous()
+    emb_cands = (
+        f"{lp_root}.embed_tokens.weight" if lp_root else "embed_tokens.weight",
+        "model.embed_tokens.weight",
+        "embed.weight",
+    )
+    emb_key = next(k for k in emb_cands if k in active_keys)
+    emb_t = pop_tensor_dequant(fetcher, emb_key, active_keys, used_special, device="cpu").to(torch.float16).contiguous()
     emb_bytes = emb_t.numpy().tobytes()
     (out_dir / "embed_tokens.bin").write_bytes(emb_bytes)
     emb_root = hashlib.sha256(emb_bytes).digest()
     del emb_bytes
 
-    lm_key_cands = ("lm_head.weight", "language_model.lm_head.weight")
+    lm_key_cands = ("lm_head.weight", "language_model.lm_head.weight", "head.weight")
     lm_key = next((k for k in lm_key_cands if k in active_keys), None)
-    lm_f32 = (fetcher.pop_tensor(lm_key, device=q_dev) if lm_key else emb_t.to(q_dev)).to(torch.float32)
+    if lm_key is not None:
+        lm_f32 = pop_tensor_dequant(fetcher, lm_key, active_keys, used_special, device=q_dev).to(torch.float32)
+    else:
+        lm_f32 = emb_t.to(device=q_dev, dtype=torch.float32)
     del emb_t
+
     max_abs = torch.clamp(lm_f32.abs().amax(dim=-1, keepdim=True), min=1e-6)
     scales_f16 = (max_abs / 127.0).to(torch.float16)
     w_i8 = torch.clamp(torch.round(lm_f32 / scales_f16.to(torch.float32)), -127, 127).to(torch.int8)
@@ -242,87 +279,53 @@ def convert_hf_hybrid_moe_to_deimos(
     if q_dev == "cuda":
         torch.cuda.empty_cache()
 
-    # 2. Stream layers 0..L-1: pack experts -> `cas_experts_q4.bin` & collect FP16 text backbone
     layout = compute_q4_leaf_layout(hidden_size, inter_size, group_size=group_size)
     stride_bytes = layout["stride_bytes"]
     payload_bytes = layout["payload_bytes"]
     pad_tail = b"\x00" * (stride_bytes - payload_bytes)
     leaf_hashes: List[bytes] = []
     backbone_sd: Dict[str, torch.Tensor] = {}
-
-    def _canon_key(k: str) -> str:
-        return "model." + k[len("model.language_model.") :] if k.startswith("model.language_model.") else k
-
-    used_special = {emb_key} | ({lm_key} if lm_key else set())
+    layers_pfx = f"{lp_root}.layers" if lp_root else "layers"
 
     with open(out_dir / "cas_experts_q4.bin", "wb") as cas_f:
         for l_idx in range(num_layers):
-            lp = f"{lp_root}.layers.{l_idx}"
-            gu_3d_k = f"{lp}.mlp.experts.gate_up_proj"
-            dn_3d_k = f"{lp}.mlp.experts.down_proj"
-
-            if gu_3d_k in active_keys:
-                used_special.update((gu_3d_k, dn_3d_k))
-                gu_t = fetcher.pop_tensor(gu_3d_k, device=q_dev)
+            lp = f"{layers_pfx}.{l_idx}"
+            if l_idx in moe_map:
+                gu_t, dn_t = extract_layer_experts_gu_dn(
+                    fetcher, lp, moe_map[l_idx], num_experts, hidden_size, inter_size,
+                    active_keys, used_special, q_dev,
+                )
                 gu_qw, gu_qs, gu_qb = quantize_torch_to_q4_bytes(gu_t, group_size=group_size)
                 del gu_t
-                dn_t = fetcher.pop_tensor(dn_3d_k, device=q_dev)
                 dn_qw, dn_qs, dn_qb = quantize_torch_to_q4_bytes(dn_t, group_size=group_size)
                 del dn_t
-            else:
-                gu_list, dn_list = [], []
                 for e_idx in range(num_experts):
-                    gk = f"{lp}.mlp.experts.{e_idx}.gate_proj.weight"
-                    uk = f"{lp}.mlp.experts.{e_idx}.up_proj.weight"
-                    dk = f"{lp}.mlp.experts.{e_idx}.down_proj.weight"
-                    used_special.update((gk, uk, dk))
-                    gu_list.append(torch.cat([fetcher.pop_tensor(gk), fetcher.pop_tensor(uk)], dim=0))
-                    dn_list.append(fetcher.pop_tensor(dk))
-                gu_qw, gu_qs, gu_qb = quantize_torch_to_q4_bytes(
-                    torch.stack(gu_list, dim=0).to(q_dev), group_size=group_size
-                )
-                dn_qw, dn_qs, dn_qb = quantize_torch_to_q4_bytes(
-                    torch.stack(dn_list, dim=0).to(q_dev), group_size=group_size
-                )
-                del gu_list, dn_list
+                    raw_leaf = (
+                        gu_qw[e_idx].tobytes() + gu_qs[e_idx].tobytes() + gu_qb[e_idx].tobytes()
+                        + dn_qw[e_idx].tobytes() + dn_qs[e_idx].tobytes() + dn_qb[e_idx].tobytes()
+                        + pad_tail
+                    )
+                    leaf_hashes.append(hashlib.sha256(raw_leaf).digest())
+                    cas_f.write(raw_leaf)
 
-            for e_idx in range(num_experts):
-                raw_leaf = (
-                    gu_qw[e_idx].tobytes()
-                    + gu_qs[e_idx].tobytes()
-                    + gu_qb[e_idx].tobytes()
-                    + dn_qw[e_idx].tobytes()
-                    + dn_qs[e_idx].tobytes()
-                    + dn_qb[e_idx].tobytes()
-                    + pad_tail
-                )
-                leaf_hashes.append(hashlib.sha256(raw_leaf).digest())
-                cas_f.write(raw_leaf)
-
-            # Collect all non-expert tensors belonging to layer `l_idx` right away so shard refcounts hit 0!
             layer_pfx = f"{lp}."
             for k in sorted(active_keys):
-                if k.startswith(layer_pfx) and k not in used_special:
-                    used_special.add(k)
-                    t_cpu = fetcher.pop_tensor(k, device="cpu")
-                    if t_cpu.dtype == torch.bfloat16:
-                        t_cpu = t_cpu.to(torch.float16)
-                    backbone_sd[_canon_key(k)] = t_cpu.contiguous()
+                if k.startswith(layer_pfx) and k not in used_special and not k.endswith("_scale_inv"):
+                    t_cpu = pop_tensor_dequant(fetcher, k, active_keys, used_special, device="cpu")
+                    ck = canonicalize_hf_key(k, lp_root)
+                    backbone_sd[ck] = _cast_backbone_tensor(ck, t_cpu)
 
             if q_dev == "cuda":
                 torch.cuda.empty_cache()
-            sys.stdout.write(
-                f"[Deimos-HF] Layer {l_idx + 1}/{num_layers} "
-                f"({(l_idx + 1) * num_experts}/{num_layers * num_experts} Q4 Merkle leaves)\n"
-            )
+            sys.stdout.write(f"[Deimos-HF] Layer {l_idx + 1}/{num_layers} ({len(leaf_hashes)}/{num_moe_layers * num_experts} Q4 leaves)\n")
             sys.stdout.flush()
 
-    # Remaining non-expert top-level text keys (e.g. `model.norm.weight`)
     for k in sorted(active_keys - used_special):
-        t_cpu = fetcher.pop_tensor(k, device="cpu")
-        if t_cpu.dtype == torch.bfloat16:
-            t_cpu = t_cpu.to(torch.float16)
-        backbone_sd[_canon_key(k)] = t_cpu.contiguous()
+        if k.endswith("_scale_inv"):
+            continue
+        t_cpu = pop_tensor_dequant(fetcher, k, active_keys, used_special, device="cpu")
+        ck = canonicalize_hf_key(k, lp_root)
+        backbone_sd[ck] = _cast_backbone_tensor(ck, t_cpu)
 
     bb_path = out_dir / "hf_backbone.safetensors"
     st_save_torch(backbone_sd, str(bb_path))
@@ -332,15 +335,17 @@ def convert_hf_hybrid_moe_to_deimos(
         core_root = hashlib.file_digest(f_bb, "sha256").digest()
     shutil.rmtree(tmp_dl, ignore_errors=True)
 
-    # Save normalized text config (`config.json`) with `num_experts` standardized
+    t_cfg.pop("quantization_config", None)
+    t_cfg.pop("quantization", None)
     t_cfg["num_experts"] = num_experts
-    t_cfg["intermediate_size"] = inter_size
+    if "moe_intermediate_size" not in t_cfg:
+        t_cfg["intermediate_size"] = inter_size
     (out_dir / "config.json").write_text(json.dumps(t_cfg, indent=2))
     (out_dir / "hf_source_config.json").write_text(json.dumps(raw_cfg, indent=2))
 
     model_root_hex, expert_root_hex = build_deimidx2_file(
         idx_path=out_dir / "merkle_tree.idx",
-        num_layers=num_layers,
+        num_layers=num_moe_layers,
         num_experts=num_experts,
         vocab_size=vocab_size,
         hidden_size=hidden_size,
@@ -364,9 +369,12 @@ def convert_hf_hybrid_moe_to_deimos(
                 "source_model": str(repo_id_or_dir),
                 "quant_bits": 4,
                 "quant_group_size": group_size,
-                "num_layers": num_layers,
+                "num_layers": num_moe_layers,
+                "num_total_layers": num_layers,
+                "moe_layer_ids": moe_layer_ids,
+                "moe_containers": moe_containers,
                 "num_experts_per_layer": num_experts,
-                "total_experts": num_layers * num_experts,
+                "total_experts": num_moe_layers * num_experts,
                 "expert_stride_bytes": stride_bytes,
                 "expert_payload_bytes": payload_bytes,
                 "orig_safetensors_bytes": orig_bytes,

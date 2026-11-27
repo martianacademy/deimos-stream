@@ -293,13 +293,27 @@ def _patch_gqa_attention(attn_mod: "nn.Module", device: "torch.device", use_q4: 
 def patch_hf_hybrid_for_cuda(
     model: "nn.Module", device: "torch.device", backbone: str = "fp16"
 ) -> bool:
-    """Applies fused Triton kernels & optional 4-bit Group-64 projections (`backbone='q4'`)."""
+    """Applies fused Triton kernels (`Qwen3.5/3.6`) or generic Group-64 Q4 projections (`backbone='q4'`)."""
+    mtype = str(getattr(getattr(model, "config", None), "model_type", "")).lower()
+    use_q4 = backbone == "q4"
+
+    if mtype not in {"qwen3_5_moe", "qwen3_5", "qwen3_5_moe_text", "qwen3_5_text", "qwen3_next"}:
+        if device.type == "cuda" and use_q4:
+            from deimos_stream.model_adapters import quantize_generic_hf_backbone_q4
+
+            quantize_generic_hf_backbone_q4(model, device)
+        model.to(device)
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        return use_q4
+
     if not hybrid_triton_available(device):
+        model.to(device)
         return False
     inner = getattr(model, "model", None)
     if inner is None or not hasattr(inner, "layers"):
+        model.to(device)
         return False
-    use_q4 = backbone == "q4"
 
     if hasattr(inner, "norm"):
         _patch_rmsnorm_zero_centered(inner.norm)

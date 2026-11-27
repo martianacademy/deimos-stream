@@ -27,6 +27,10 @@ from deimos_stream.factory import AnyDeimosEngine, create_paged_moe_engine
 from deimos_stream.fast_decode import iter_decode_tokens, supports_pipeline
 from deimos_stream.hf_converter import convert_hf_hybrid_moe_to_deimos
 from deimos_stream.memory_budget import SlotsArg, parse_slots_arg
+from deimos_stream.model_adapters import (
+    list_supported_moe_families,
+    should_use_hf_hybrid_converter,
+)
 
 
 class DeimosChatSession:
@@ -352,6 +356,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p_insp.add_argument("--store-dir", type=Path, required=True)
     p_insp.add_argument("--verify-leaves", action="store_true", help="Verify all SHA-256 leaves")
 
+    sub.add_parser("models", help="List supported Sparse & Hybrid MoE model families and roadmap")
+
     p_srv = sub.add_parser("serve", help="Launch OpenAI-compatible HTTP & SSE /v1/chat/completions server")
     p_srv.add_argument("--store-dir", type=Path, required=True, help="DEIMIDX2 Q4 store folder")
     p_srv.add_argument("--convert-from", type=Path, default=None, help="Optional .safetensors folder to convert first")
@@ -371,18 +377,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     args = parser.parse_args(argv)
 
+    if args.command == "models":
+        print(json.dumps(list_supported_moe_families(), indent=2))
+        return 0
+
     if args.command == "convert":
-        if args.hf_hybrid or not Path(args.model_dir).expanduser().exists():
+        local_p = Path(args.model_dir).expanduser()
+        if args.hf_hybrid or not local_p.exists() or should_use_hf_hybrid_converter(local_p):
             out = convert_hf_hybrid_moe_to_deimos(
-                args.model_dir,
-                args.output_dir,
-                group_size=args.group_size,
-                delete_downloaded_shards=args.delete_shards,
+                args.model_dir, args.output_dir, group_size=args.group_size, delete_downloaded_shards=args.delete_shards
             )
         else:
-            out = convert_safetensors_moe_to_deimos_q4(
-                Path(args.model_dir), args.output_dir, group_size=args.group_size
-            )
+            out = convert_safetensors_moe_to_deimos_q4(local_p, args.output_dir, group_size=args.group_size)
         print(json.dumps({"status": "ok", "output_store_dir": str(out)}, indent=2))
         return 0
 
