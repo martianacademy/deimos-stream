@@ -22,6 +22,7 @@ from deimos_stream.fast_decode import apply_q4_backbone, apply_q4_backbone_mlx_h
 from deimos_stream.hf_streamer import DeimosHFHybridMoEEngine
 from deimos_stream.memory_budget import SlotPlan, SlotsArg, parse_slots_arg, plan_slots
 from deimos_stream.mlx_hybrid import DeimosMLXHybridMoEEngine
+from deimos_stream.mlx_universal import DeimosMLXUniversalMoEEngine
 from deimos_stream.torch_arena import HAS_TORCH
 from deimos_stream.torch_engine import TorchDeimosPagedMoEEngine
 
@@ -33,6 +34,7 @@ else:
 AnyDeimosEngine = Union[
     DeimosPagedMoEEngine,
     DeimosMLXHybridMoEEngine,
+    DeimosMLXUniversalMoEEngine,
     TorchDeimosPagedMoEEngine,
     DeimosHFHybridMoEEngine,
 ]
@@ -123,9 +125,16 @@ def create_paged_moe_engine(
     eng: AnyDeimosEngine
     if is_hybrid:
         if resolved == "mlx":
-            eng = DeimosMLXHybridMoEEngine(backbone=backbone, **common)  # type: ignore[arg-type]
-            if backbone == "q4":
-                apply_q4_backbone_mlx_hybrid(eng)
+            mtype = ""
+            cfg_p = sdir / "config.json"
+            if cfg_p.exists():
+                mtype = str(json.loads(cfg_p.read_text()).get("model_type", "")).lower()
+            if mtype in {"qwen3_5_moe", "qwen3_5", "qwen3_5_moe_text", "qwen3_5_text"}:
+                eng = DeimosMLXHybridMoEEngine(backbone=backbone, **common)  # type: ignore[arg-type]
+                if backbone == "q4":
+                    apply_q4_backbone_mlx_hybrid(eng)
+            else:
+                eng = DeimosMLXUniversalMoEEngine(backbone=backbone, **common)  # type: ignore[arg-type]
         else:
             eng = DeimosHFHybridMoEEngine(device_str=resolved, backbone=backbone, **common)  # type: ignore[arg-type]
     elif resolved == "mlx":

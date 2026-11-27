@@ -31,6 +31,7 @@ from deimos_stream.backbone import rss_mb
 from deimos_stream.engine import BenchmarkMetrics
 from deimos_stream.hf_cuda_graph import DeimosHFCudaGraphDecode, can_use_hf_cuda_graph
 from deimos_stream.hf_fast_patch import patch_hf_hybrid_for_cuda
+from deimos_stream.model_adapters import bind_hf_moe_layer
 from deimos_stream.torch_arena import HAS_TORCH, TorchPagedExpertArena
 from deimos_stream.triton_q4 import (
     quantize_2d_q4_torch,
@@ -82,6 +83,7 @@ class DeimosMmapEmbedding(_NNModule):  # type: ignore[misc,valid-type]
         ).reshape(vocab_size, hidden_size)
         self.device = device
         self.dtype = dtype
+        self.register_buffer("weight", torch.empty((0,), dtype=dtype, device=device), persistent=False)
 
     def forward(self, input_ids: "torch.Tensor") -> "torch.Tensor":
         ids_np = input_ids.detach().cpu().numpy()
@@ -187,13 +189,15 @@ class DeimosPagedHFExperts(_NNModule):  # type: ignore[misc,valid-type]
             not self.arena.is_cuda
             and eng.enable_lookahead
             and hidden_states.shape[0] == 1
-            and (self.layer_idx + 1 < eng.num_layers)
+            and (self.layer_idx + 1 < self.arena.num_layers)
             and self.next_gate is not None
         ):
             def _la() -> "torch.Tensor":
                 la_in = self.next_norm(hidden_states) if self.next_norm is not None else hidden_states
                 la_out = self.next_gate(la_in)  # type: ignore[misc]
-                return la_out[2] if isinstance(la_out, tuple) and len(la_out) >= 3 else la_out[0]
+                if isinstance(la_out, tuple):
+                    return la_out[2] if len(la_out) >= 3 else la_out[1]
+                return torch.topk(la_out, k=eng.top_k, dim=-1)[1]
             la_fn = _la
 
         return self.arena.forward_moe(
@@ -206,30 +210,6 @@ class DeimosPagedHFExperts(_NNModule):  # type: ignore[misc,valid-type]
             shared_fn=shared_fn,  # type: ignore[arg-type]
             la_ids_fn=la_fn,
         )
-
-
-def _bind_overlapped_moe_block(mlp_mod: "nn.Module", paged_exp: DeimosPagedHFExperts) -> None:
-    """Routes first, then overlaps GPU `shared_expert` + hit experts with CPU SIMD miss compute."""
-    if not (hasattr(mlp_mod, "gate") and hasattr(mlp_mod, "shared_expert") and hasattr(mlp_mod, "shared_expert_gate")):
-        return
-
-    def _fast_mlp_forward(hidden_states: "torch.Tensor") -> "torch.Tensor":
-        B, L, D = hidden_states.shape
-        x_flat = hidden_states.reshape(-1, D)
-        gate_out = mlp_mod.gate(x_flat)  # type: ignore[operator]
-        if isinstance(gate_out, tuple) and len(gate_out) >= 3:
-            _, routing_weights, selected_experts = gate_out[0], gate_out[1], gate_out[2]
-        else:
-            routing_weights, selected_experts = gate_out[0], gate_out[1]
-
-        def _run_shared() -> "torch.Tensor":
-            sh_y = mlp_mod.shared_expert(x_flat)  # type: ignore[operator]
-            return torch.sigmoid(mlp_mod.shared_expert_gate(x_flat)) * sh_y  # type: ignore[operator]
-
-        out = paged_exp(x_flat, selected_experts, routing_weights, shared_fn=_run_shared)
-        return out.reshape(B, L, D)
-
-    mlp_mod.forward = _fast_mlp_forward  # type: ignore[method-assign]
 
 
 class DeimosHFHybridMoEEngine:
@@ -266,6 +246,12 @@ class DeimosHFHybridMoEEngine:
             (self.store_dir / "merkle_manifest.json").read_text()
         )
         self.num_layers = int(self.config["num_hidden_layers"])  # type: ignore[arg-type]
+        self.moe_layer_ids: List[int] = [
+            int(x) for x in self.manifest.get("moe_layer_ids", list(range(self.num_layers)))  # type: ignore[union-attr]
+        ]
+        self.moe_containers: List[str] = [
+            str(x) for x in self.manifest.get("moe_containers", ["mlp"] * len(self.moe_layer_ids))  # type: ignore[union-attr]
+        ]
         self.num_experts = int(self.config["num_experts"])  # type: ignore[arg-type]
         self.hidden_size = int(self.config["hidden_size"])  # type: ignore[arg-type]
         self.vocab_size = int(self.config["vocab_size"])  # type: ignore[arg-type]
@@ -293,23 +279,25 @@ class DeimosHFHybridMoEEngine:
             model = AutoModelForCausalLM.from_config(text_cfg, trust_remote_code=True)
         self._cache_kwarg = "cache" if "cache" in inspect.signature(model.forward).parameters else "past_key_values"
 
+        inner_lm = getattr(model.model, "language_model", model.model)
         self._mmap_emb = DeimosMmapEmbedding(
             self.store_dir / "embed_tokens.bin", self.vocab_size, self.hidden_size, self.device, self.compute_dtype
         )
-        model.model.embed_tokens = self._mmap_emb
+        inner_lm.embed_tokens = self._mmap_emb
         model.lm_head = DeimosInt8LMHead(
             self.store_dir / "lm_head_int8.bin", self.vocab_size, self.hidden_size,
             self.device, self.compute_dtype, use_q4=False,
         )
-        if hasattr(model.model, "rotary_emb"):
-            rot_cls = type(model.model.rotary_emb)
-            model.model.rotary_emb = rot_cls(config=text_cfg).to(self.device)
+        if hasattr(inner_lm, "rotary_emb"):
+            rot_cls = type(inner_lm.rotary_emb)
+            inner_lm.rotary_emb = rot_cls(config=text_cfg).to(self.device)
 
         paged_mods: List[DeimosPagedHFExperts] = []
-        for l_i in range(self.num_layers):
-            pmod = DeimosPagedHFExperts(l_i, self.arena, self)
-            model.model.layers[l_i].mlp.experts = pmod
-            _bind_overlapped_moe_block(model.model.layers[l_i].mlp, pmod)
+        router_mods: List[Optional[nn.Module]] = []
+        for a_i, l_i in enumerate(self.moe_layer_ids):
+            pmod = DeimosPagedHFExperts(a_i, self.arena, self)
+            c_attr = self.moe_containers[a_i] if a_i < len(self.moe_containers) else "mlp"
+            router_mods.append(bind_hf_moe_layer(inner_lm.layers[l_i], c_attr, pmod))
             paged_mods.append(pmod)
 
         bb_path = self.store_dir / "hf_backbone.safetensors"
@@ -327,10 +315,11 @@ class DeimosHFHybridMoEEngine:
         casted_bb.clear()
         gc.collect()
 
-        for l_i in range(self.num_layers - 1):
-            nxt = model.model.layers[l_i + 1]
-            paged_mods[l_i].next_norm = getattr(nxt, "post_attention_layernorm", None)
-            paged_mods[l_i].next_gate = nxt.mlp.gate
+        for a_i in range(len(paged_mods) - 1):
+            if self.moe_layer_ids[a_i + 1] == self.moe_layer_ids[a_i] + 1 and router_mods[a_i + 1] is not None:
+                nxt = inner_lm.layers[self.moe_layer_ids[a_i + 1]]
+                paged_mods[a_i].next_norm = getattr(nxt, "post_attention_layernorm", getattr(nxt, "pre_ff_layernorm", None))
+                paged_mods[a_i].next_gate = router_mods[a_i + 1]
 
         patch_hf_hybrid_for_cuda(model, self.device, backbone=self.backbone)
         if self.arena._evict_host_on_stage and hasattr(os, "posix_fadvise") and hasattr(os, "POSIX_FADV_DONTNEED"):

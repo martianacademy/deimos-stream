@@ -20,6 +20,11 @@ from deimos_stream.hf_converter import convert_hf_hybrid_moe_to_deimos
 from deimos_stream.hf_streamer import DeimosHFHybridMoEEngine
 from deimos_stream.kv_cache import MerkleKVPrefixCache
 from deimos_stream.mlx_hybrid import DeimosMLXHybridMoEEngine
+from deimos_stream.mlx_universal import DeimosMLXUniversalMoEEngine
+from deimos_stream.model_adapters import (
+    SUPPORTED_MOE_FAMILIES,
+    list_supported_moe_families,
+)
 from deimos_stream.merkle_builder import (
     PAGE_SIZE,
     build_deimidx2_file,
@@ -30,7 +35,7 @@ from deimos_stream.merkle_builder import (
 from deimos_stream.torch_arena import TorchPagedExpertArena
 from deimos_stream.torch_engine import TorchDeimosPagedMoEEngine
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 
 
 def __getattr__(name: str) -> object:
@@ -52,12 +57,14 @@ __all__ = [
     "DeimosChatSession",
     "DeimosHFHybridMoEEngine",
     "DeimosMLXHybridMoEEngine",
+    "DeimosMLXUniversalMoEEngine",
     "DeimosMerkleBridge",
     "DeimosMerkleIntegrityError",
     "DeimosPagedMoEEngine",
     "IncrementalStreamingDetokenizer",
     "MerkleKVPrefixCache",
     "PagedExpertArena",
+    "SUPPORTED_MOE_FAMILIES",
     "TorchDeimosPagedMoEEngine",
     "TorchPagedExpertArena",
     "__version__",
@@ -70,6 +77,7 @@ __all__ = [
     "create_deimos_app",
     "create_paged_moe_engine",
     "inspect_store",
+    "list_supported_moe_families",
     "normalize_moe_config",
     "resolve_backend",
 ]
