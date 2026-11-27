@@ -48,6 +48,7 @@ from deimos_stream.model_adapters import (
     pop_tensor_dequant,
     validate_convertible_architecture,
 )
+from deimos_stream.mtp_store import discover_mtp_spec, export_mtp_head_to_store
 from deimos_stream.torch_arena import HAS_TORCH
 
 if HAS_TORCH:
@@ -291,6 +292,8 @@ def convert_hf_hybrid_moe_to_deimos(
     q_dev = "cuda" if torch.cuda.is_available() else "cpu"
 
     active_keys = {k for k in weight_map if not is_ignored_checkpoint_key(k, num_layers)}
+    mtp_spec = discover_mtp_spec(raw_cfg, weight_map)
+    needed_all = active_keys | (set(mtp_spec["needed_keys"]) if mtp_spec is not None else set())
     lp_root = detect_lm_prefix(active_keys)
     moe_specs = discover_hf_moe_layers(num_layers, lp_root, active_keys)
     if not moe_specs:
@@ -301,7 +304,7 @@ def convert_hf_hybrid_moe_to_deimos(
     num_moe_layers = len(moe_layer_ids)
 
     fetcher = _RefCountedShardFetcher(
-        repo_id_or_dir, tmp_dl, active_keys, weight_map, delete_shards=delete_downloaded_shards
+        repo_id_or_dir, tmp_dl, needed_all, weight_map, delete_shards=delete_downloaded_shards
     )
     used_special: Set[str] = set()
 
@@ -386,6 +389,9 @@ def convert_hf_hybrid_moe_to_deimos(
         ck = canonicalize_hf_key(k, lp_root)
         backbone_sd[ck] = _cast_backbone_tensor(ck, t_cpu)
 
+    mtp_manifest = export_mtp_head_to_store(
+        mtp_spec, raw_cfg, fetcher, out_dir, quantize_fn=quantize_torch_to_q4_bytes, group_size=group_size, q_dev=q_dev
+    )
     fetcher.close()
     bb_path = out_dir / "hf_backbone.safetensors"
     st_save_torch(backbone_sd, str(bb_path))
@@ -442,6 +448,7 @@ def convert_hf_hybrid_moe_to_deimos(
                 "orig_safetensors_bytes": orig_bytes,
                 "model_merkle_root": model_root_hex,
                 "expert_tree_root": expert_root_hex,
+                "has_mtp_head": mtp_manifest is not None,
                 "conversion_time_sec": round(time.perf_counter() - t0, 2),
             },
             indent=2,

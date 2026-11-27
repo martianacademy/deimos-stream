@@ -7,7 +7,7 @@
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-brightgreen.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/martianacademy/deimos-stream/blob/main/LICENSE)
 
-**DeimosStream (`v0.9.0`)** is a universal low-VRAM **Sparse Mixture-of-Experts (MoE) LLM streaming engine** — the language-model twin to [**PhobosStream**](https://github.com/martianacademy/phobos-stream) — built to run **2026 Frontier Sparse & Hybrid MoE models** (**`Qwen3.6 / Qwen3.8 Hybrid`**, **`DeepSeek-V4-Flash / V3.2 / R1`**, **`GLM-5.3-Flash / GLM-4.7-Flash`**, **`MiniMax-M3.1-Flash`**, **`Kimi-K3 / K2.5 / Kimi-Linear`**, **`LiquidAI LFM2.5-MoE`**, **`Ling-3.2`**, **`Llama-4`**) faster than **`llama.cpp` (`--n-cpu-moe`)** and **`mlx-lm`** inside strictly bounded GPU & Host memory, with **zero quality loss (`--tau 1.0` exact routing)** and optional **cryptographic SHA-256 Merkle proof verification (`DEIMIDX2`)** on every cold expert page.
+**DeimosStream (`v0.10.0`)** is a universal low-VRAM **Sparse Mixture-of-Experts (MoE) LLM streaming engine** — the language-model twin to [**PhobosStream**](https://github.com/martianacademy/phobos-stream) — built to run **2026 Frontier Sparse & Hybrid MoE models** (**`Qwen3.6 / Qwen3.8 Hybrid`**, **`DeepSeek-V4-Flash / V3.2 / R1`**, **`GLM-5.3-Flash / GLM-4.7-Flash`**, **`MiniMax-M3.1-Flash`**, **`Kimi-K3 / K2.5 / Kimi-Linear`**, **`LiquidAI LFM2.5-MoE`**, **`Ling-3.2`**, **`Llama-4`**) faster than **`llama.cpp` (`--n-cpu-moe`)** and **`mlx-lm`** inside strictly bounded GPU & Host memory, with **zero quality loss (`--tau 1.0` exact routing)** and optional **cryptographic SHA-256 Merkle proof verification (`DEIMIDX2`)** on every cold expert page.
 
 By combining **Native `nvcc` `sm_61+` `__dp4a` CUDA Q4/INT8 Kernels** (`238 GB/s` INT8 GEMV • `222 GB/s` Q4 dense GEMV • `137 GB/s` gathered paged Q4 SwiGLU on Tesla T4), **81-Segment Static CUDA Graphs** with zero-spill Triton `GatedDeltaNet` recurrent state updates, a **Zero-PCIe C++17 `Q8_1 × Q4` `AVX2/NEON` Hybrid Miss Engine** with disjoint `< 24 GiB` `madvise(MADV_DONTNEED)` Host page-cache management, and **Compiled Apple Silicon `MLX` Metal Decode (`@mx.compile` + `mx.async_eval`)**, DeimosStream achieves at **exact `tau=1.0` routing**:
 * **306B `zai-org/GLM-5.3-Flash` (`305.78 GiB` FP8, `12,096` experts) on a single 15 GB T4 & 24 GB A10 GPU:**
@@ -137,7 +137,7 @@ By combining **Native `nvcc` `sm_61+` `__dp4a` CUDA Q4/INT8 Kernels** (`238 GB/s
 
 ---
 
-## 🏛️ System Architecture (`v0.9.0`)
+## 🏛️ System Architecture (`v0.10.0`)
 
 ```mermaid
 flowchart TD
@@ -176,8 +176,8 @@ flowchart TD
    - Identical `DEIMIDX2` store runs natively on **Apple Silicon MLX** (`@mx.compile` paged SwiGLU + `mx.async_eval` pipelining + `F_NOCACHE` preload + universal `DeimosMLXSwitchGLU`) and **NVIDIA CUDA** with optional SHA-256 leaf verification (`DeimosMerkleIntegrityError` on any 1-bit disk corruption) and `O(1)` Robin-Hood Merkle KV-prefix caching (`4.29×` faster warm multi-turn TTFT).
 5. **Trait-Based Universal MoE Adapter & Zero-Copy Native `FP8` Engine (`model_adapters.py`, `fp8_engine.py`)**:
    - Automatically discovers mixed dense + MoE layer schedules (`first_k_dense_replace`, `moe_layers`, `mlp_only_layers`), supports clamped & `SwiGLU-OAI` activations (`GLM-5.3`, `DeepSeek-V4`, `MiniMax-M3.1`), and streams raw multi-shard `FP8 E4M3` / `UE8M0` `.safetensors` checkpoints directly with **zero extra disk space** (`287–302 GB/s` custom Metal LUT kernel on Apple Silicon).
-6. **Persistent `.deimos_heat` Warm Slot Profile & Lossless `--speculative` / MTP Decode (`heat_profile.py`, `speculative.py`)**:
-   - Persists EMA-decayed per-layer expert routing heat across sessions (`2.76×` faster warm TTFT at `0.0` logit drift) and verifies multi-token `SuffixNgram` / `MTP` drafts in a single coalesced pass with exact Leviathan rejection sampling and hybrid recurrent-cache rollback.
+6. **Persistent `.deimos_heat` Warm Slot Profile & Native Checkpoint `MTP` / `--speculative` Decode (`heat_profile.py`, `mtp_store.py`, `mtp_drafter.py`, `mtp_mlx.py`, `speculative.py`)**:
+   - Persists EMA-decayed per-layer expert routing heat across sessions (`2.76×` faster warm TTFT at `0.0` logit drift), automatically extracts checkpoint-native `mtp.*` / `NextN` (`layers.{N}`) heads (`Qwen3.6/3.8`, `GLM-5.3/4.7`, `DeepSeek-V3/V3.2`) into compact Group-64 Q4 `mtp_head.safetensors` (or streams raw `FP8` `NextN` shards directly), and verifies multi-token drafts in a single coalesced pass across CUDA `__dp4a`, PyTorch, and Apple Silicon `MLX` (`mx.gather_qmm`).
 
 ---
 
@@ -251,8 +251,8 @@ deimos-stream convert \
 # 2. Cryptographically verify the Tier-1 XOR Merkle tree & all Tier-2 SHA-256 expert leaves:
 deimos-stream inspect --store-dir ./qwen36_35b_deimos_q4 --verify-leaves
 
-# 3. Maximum speed with exact routing (`--backbone q4 --tau 1.0`, auto-sizes GPU slots to free VRAM):
-deimos-stream chat --store-dir ./qwen36_35b_deimos_q4 --backbone q4 --tau 1.0 --no-verify
+# 3. Maximum speed with exact routing (`--backbone q4 --tau 1.0`, auto-sizes GPU slots to free VRAM; add `--speculative` to activate native MTP / N-gram drafting):
+deimos-stream chat --store-dir ./qwen36_35b_deimos_q4 --backbone q4 --tau 1.0 --speculative --no-verify
 
 # 4. Run 35B Qwen3.6 inside 6.4 GiB VRAM (@ 38.8 tok/s on T4) or 2.7 GiB VRAM (@ 29.9 tok/s on T4):
 deimos-stream chat --store-dir ./qwen36_35b_deimos_q4 --backbone q4 --slots 64 --tau 1.0 --no-verify

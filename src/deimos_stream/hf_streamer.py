@@ -285,6 +285,12 @@ class DeimosHFHybridMoEEngine:
         gc.collect()
 
         inner_lm = getattr(model.model, "language_model", model.model)
+        self._last_hidden_states: Optional[torch.Tensor] = None
+        inner_lm.register_forward_hook(
+            lambda _m, _i, out: setattr(
+                self, "_last_hidden_states", getattr(out, "last_hidden_state", out[0] if isinstance(out, tuple) else out)
+            )
+        )
         self._mmap_emb = DeimosMmapEmbedding(
             self.store_dir / "embed_tokens.bin", self.vocab_size, self.hidden_size, self.device, self.compute_dtype
         )

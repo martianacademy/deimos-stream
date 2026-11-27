@@ -74,6 +74,7 @@ class DeimosHFCudaGraphDecode:
         self.static_h = torch.zeros((1, 1, self.D), dtype=self.dtype, device=self.device)
         self.static_res = torch.zeros((1, 1, self.D), dtype=self.dtype, device=self.device)
         self.static_normed = torch.zeros((1, 1, self.D), dtype=self.dtype, device=self.device)
+        self.static_head_h = torch.zeros((1, 1, self.D), dtype=self.dtype, device=self.device)
         self.static_x_flat = torch.zeros((1, self.D), dtype=self.dtype, device=self.device)
         self.static_sh_out = torch.zeros((1, self.D), dtype=self.dtype, device=self.device)
         self.static_logits = torch.zeros((1, eng.vocab_size), dtype=self.dtype, device=self.device)
@@ -174,6 +175,7 @@ class DeimosHFCudaGraphDecode:
 
     def _head_op(self) -> None:
         h_n = self.inner.norm(self.static_h)
+        self.static_head_h.copy_(h_n)
         self.static_logits.copy_(self.eng.model.lm_head(h_n).view(1, self.eng.vocab_size))
 
     def _capture_all(self) -> None:
@@ -335,6 +337,7 @@ class DeimosHFCudaGraphDecode:
 
         assert self._head_graph is not None
         self._head_graph.replay()
+        self.eng._last_hidden_states = self.static_head_h
         self._cur_pos += 1
         cache._deimos_gpos = self._cur_pos
         return self.static_logits

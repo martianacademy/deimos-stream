@@ -396,6 +396,7 @@ class DeimosMLXHybridMoEEngine:
     ) -> "mx.array":
         inp = mx.array([list(token_ids)], dtype=mx.int32)
         h = self.model.model(inp, cache=caches)
+        self._last_hidden_states = h
         if not all_positions:
             h = h[:, -1:, :]
         logits = self.model.lm_head(h)

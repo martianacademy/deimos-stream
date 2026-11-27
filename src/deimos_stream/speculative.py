@@ -295,12 +295,20 @@ def iter_speculative_tokens(
         prompt_ids, max_draft=3 if has_recurrent else max_draft, min_ngram=3 if has_recurrent else 2
     )
     mtp_drafter = getattr(eng, "mtp_drafter", None)
+    if mtp_drafter is None:
+        from deimos_stream.mtp_drafter import attach_mtp_drafter_if_available
+
+        mtp_drafter = attach_mtp_drafter_if_available(eng)
+    is_stateful_mtp = bool(getattr(mtp_drafter, "is_stateful_mtp", False))
+    if is_stateful_mtp:
+        mtp_drafter.on_prefill(prompt_ids, getattr(eng, "_last_hidden_states", None))
 
     stats: Dict[str, Any] = {
         "drafted_tokens": 0,
         "accepted_tokens": 0,
         "target_calls": 0,
         "acceptance_rate_pct": 0.0,
+        "mtp_active": mtp_drafter is not None,
     }
     eng.last_spec_stats = stats
 
@@ -343,6 +351,10 @@ def iter_speculative_tokens(
             if not draft_ids:
                 stats["target_calls"] += 1
                 logits_1 = eng.forward_logits([cur_tok], caches=caches)
+                if is_stateful_mtp:
+                    mtp_drafter.on_target_step(
+                        cur_tok, (), getattr(eng, "_last_hidden_states", None), draft_ran=False
+                    )
                 cur_tok = eng.sample_next_token(logits_1, temperature=temperature)
                 continue
 
@@ -372,11 +384,20 @@ def iter_speculative_tokens(
                 _restore_recurrent_and_trim(caches, snap, 1 + k_draft)
                 replay_in = batch_in[: 1 + accepted]
                 stats["target_calls"] += 1
-                logits_rep = eng.forward_logits(replay_in, caches=caches, all_positions=False)
+                logits_rep = eng.forward_logits(replay_in, caches=caches, all_positions=is_stateful_mtp)
                 if temperature <= 1e-5:
-                    bonus_tok = eng.sample_next_token(logits_rep, temperature=0.0)
+                    rep_last = logits_rep[:, -1, :] if logits_rep.ndim == 3 else logits_rep
+                    bonus_tok = eng.sample_next_token(rep_last, temperature=0.0)
                 if getattr(eng, "_graph_runner", None) is not None and caches and caches[0] is not None:
                     eng._graph_runner._sync_from_hf_cache(caches[0])
+
+            if is_stateful_mtp:
+                mtp_drafter.on_target_step(
+                    cur_tok,
+                    draft_ids[:accepted],
+                    getattr(eng, "_last_hidden_states", None),
+                    draft_ran=True,
+                )
 
             for j in range(accepted):
                 acc_tok = draft_ids[j]

@@ -20,6 +20,8 @@ from deimos_stream.hf_converter import convert_hf_hybrid_moe_to_deimos
 from deimos_stream.hf_streamer import DeimosHFHybridMoEEngine
 from deimos_stream.heat_profile import compute_warm_slot_plan, load_heat_counts
 from deimos_stream.kv_cache import MerkleKVPrefixCache
+from deimos_stream.mtp_drafter import attach_mtp_drafter_if_available
+from deimos_stream.mtp_store import discover_mtp_spec
 from deimos_stream.speculative import SuffixNgramDrafter, iter_speculative_tokens
 from deimos_stream.mlx_hybrid import DeimosMLXHybridMoEEngine
 from deimos_stream.mlx_universal import DeimosMLXUniversalMoEEngine
@@ -37,7 +39,7 @@ from deimos_stream.merkle_builder import (
 from deimos_stream.torch_arena import TorchPagedExpertArena
 from deimos_stream.torch_engine import TorchDeimosPagedMoEEngine
 
-__version__ = "0.9.0"
+__version__ = "0.10.0"
 
 
 def __getattr__(name: str) -> object:
@@ -67,19 +69,25 @@ __all__ = [
     "MerkleKVPrefixCache",
     "PagedExpertArena",
     "SUPPORTED_MOE_FAMILIES",
+    "SuffixNgramDrafter",
     "TorchDeimosPagedMoEEngine",
     "TorchPagedExpertArena",
     "__version__",
+    "attach_mtp_drafter_if_available",
     "build_deimidx2_file",
     "compile_deimos_dylib",
     "compute_q4_leaf_layout",
+    "compute_warm_slot_plan",
     "convert_fp16_cas_store_to_q4",
     "convert_hf_hybrid_moe_to_deimos",
     "convert_safetensors_moe_to_deimos_q4",
     "create_deimos_app",
     "create_paged_moe_engine",
+    "discover_mtp_spec",
     "inspect_store",
+    "iter_speculative_tokens",
     "list_supported_moe_families",
+    "load_heat_counts",
     "normalize_moe_config",
     "resolve_backend",
 ]
