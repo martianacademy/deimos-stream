@@ -420,11 +420,12 @@ class DeimosMLXHybridMoEEngine:
         ttft_ms = (time.perf_counter() - t_pf) * 1000.0
 
         self.arena.reset_telemetry()
-        gen_ids = [tok]
+        from deimos_stream.fast_decode import iter_decode_tokens
+
         t_dec = time.perf_counter()
-        for _ in range(max_new_tokens):
-            logits = self.forward_logits([gen_ids[-1]], caches=caches)
-            gen_ids.append(self.sample_next_token(logits, temperature=0.0))
+        gen_ids = list(
+            iter_decode_tokens(self, logits, caches, max_new_tokens + 1, prompt_ids=prompt_ids)
+        )
         decode_sec = max(1e-6, time.perf_counter() - t_dec)
         self.arena.wait_idle()
 

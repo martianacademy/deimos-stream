@@ -49,6 +49,7 @@ class DeimosChatSession:
         temperature: float = 0.0,
         max_memory_gb: Optional[float] = None,
         backbone: str = "fp16",
+        enable_speculative: bool = False,
     ):
         self.store_dir: Path = Path(store_dir).expanduser().resolve()
         self.backend: str = backend
@@ -67,6 +68,7 @@ class DeimosChatSession:
             enable_merkle_kv=enable_merkle_kv,
             miss_tail_tau=miss_tail_tau,
         )
+        self.engine.enable_speculative = bool(enable_speculative)  # type: ignore[attr-defined]
         eos_cfg = self.engine.config.get("eos_token_id", 50279)
         if isinstance(eos_cfg, list):
             self.stop_ids: Set[int] = {int(x) for x in eos_cfg}
@@ -119,7 +121,7 @@ class DeimosChatSession:
         gen_ids: List[int] = []
         t_dec = time.perf_counter()
         gen = iter_decode_tokens(
-            self.engine, logits, caches, max_new_tokens, self.temperature, self.stop_ids
+            self.engine, logits, caches, max_new_tokens, self.temperature, self.stop_ids, prompt_ids=prompt_ids
         )
         try:
             for tok_id in gen:
@@ -338,6 +340,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p_chat.add_argument("--no-verify", action="store_true", help="Skip cold-load SHA-256 leaf verification on trusted local SSDs")
     p_chat.add_argument("--mmap", action="store_true", help="Use OS mmap page cache (default)")
     p_chat.add_argument("--nocache", action="store_true", help="Bypass OS page cache via F_NOCACHE/O_DIRECT pread")
+    p_chat.add_argument("--speculative", action="store_true", help="Enable lossless target-verified speculative/MTP decoding")
     p_chat.add_argument("--temp", type=float, default=0.0)
     p_chat.add_argument("--max-tokens", type=int, default=256)
     p_chat.add_argument("--prompt", type=str, default=None)
@@ -345,18 +348,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p_bench = sub.add_parser("bench", help="Benchmark VRAM, hit rate, TTFT, and decode tok/s")
     p_bench.add_argument("--store-dir", type=Path, required=True)
     p_bench.add_argument("--backend", type=str, default="auto", choices=["auto", "mlx", "cuda", "cpu"])
-    p_bench.add_argument("--slots", type=parse_slots_arg, default="auto", help="Expert slots per layer: auto (pin all if memory allows, else fit free memory) or a number")
-    p_bench.add_argument("--max-memory-gb", type=float, default=None, help="Cap the total memory budget for --slots auto")
-    p_bench.add_argument("--backbone", choices=["fp16", "q4"], default="fp16", help="q4: 4-bit dense projections + lm_head across MLX & CUDA")
+    p_bench.add_argument("--slots", type=parse_slots_arg, default="auto", help="Expert slots per layer: auto or integer")
+    p_bench.add_argument("--max-memory-gb", type=float, default=None, help="Cap total memory budget for --slots auto")
+    p_bench.add_argument("--backbone", choices=["fp16", "q4"], default="fp16", help="q4: 4-bit dense projections + lm_head")
     p_bench.add_argument("--tau", type=float, default=0.85)
     p_bench.add_argument("--no-verify", action="store_true", help="Skip cold-load SHA-256 leaf verification")
     p_bench.add_argument("--nocache", action="store_true", help="Bypass OS page cache via F_NOCACHE/O_DIRECT pread")
+    p_bench.add_argument("--speculative", action="store_true", help="Enable lossless target-verified speculative/MTP decoding")
     p_bench.add_argument("--tokens", type=int, default=32)
-    p_bench.add_argument(
-        "--prompt",
-        type=str,
-        default="<|user|>\nExplain how Merkle trees verify paged neural weights.\n<|assistant|>\n",
-    )
+    p_bench.add_argument("--prompt", type=str, default="<|user|>\nExplain how Merkle trees verify paged neural weights.\n<|assistant|>\n")
 
     p_insp = sub.add_parser("inspect", help="Verify DEIMIDX2 Merkle index & print topology")
     p_insp.add_argument("--store-dir", type=Path, required=True)
@@ -415,6 +415,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             enable_lookahead=True,
             miss_tail_tau=args.tau,
         )
+        eng.enable_speculative = bool(args.speculative)  # type: ignore[attr-defined]
         try:
             if eng.tokenizer is not None:
                 metrics = eng.benchmark_generation(args.prompt, max_new_tokens=args.tokens)
@@ -424,6 +425,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             metrics["slot_plan"] = plan.as_dict() if plan is not None else None  # type: ignore[index]
             metrics["backbone"] = getattr(eng, "backbone", "fp16")  # type: ignore[index]
             metrics["pipelined_decode"] = supports_pipeline(eng)  # type: ignore[index]
+            metrics["speculative"] = getattr(eng, "last_spec_stats", None)  # type: ignore[index]
             print(json.dumps(metrics, indent=2))
         finally:
             eng.close()
@@ -468,6 +470,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             use_nocache_pread=bool(args.nocache),
             verify_merkle_on_cold=not args.no_verify,
             temperature=args.temp,
+            enable_speculative=bool(args.speculative),
         )
         try:
             if args.prompt is not None:

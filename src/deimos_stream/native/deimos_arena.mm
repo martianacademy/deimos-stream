@@ -32,6 +32,7 @@ void* deimos_arena_create(
     mgr->phys_to_virt.assign(nL, std::vector<int32_t>(nC, -1));
     mgr->slot_freq.assign(nL, std::vector<int32_t>(nC, 0));
     mgr->expert_freq.assign(nL, std::vector<uint32_t>(nE, 0));
+    mgr->total_expert_hits.assign(nL, std::vector<uint32_t>(nE, 0));
     mgr->slot_step.assign(nL, std::vector<int64_t>(nC, 0));
     mgr->slot_gen.assign(nL, std::vector<uint64_t>(nC, 0));
     mgr->prefetched_flag.assign(nL, std::vector<uint8_t>(nE, 0));
@@ -123,6 +124,8 @@ int deimos_arena_resolve_and_prefetch(
     for (int i = 0; i < total_eval; ++i) {
         int e = work_ids[i];
         if (e < 0 || e >= mgr->num_experts) return DEIMOS_ERR_INVALID_ARG;
+        if (mgr->expert_freq[layer_idx][e] < 64u) mgr->expert_freq[layer_idx][e] += 1u;
+        if (mgr->total_expert_hits[layer_idx][e] < 0x3fffffffU) mgr->total_expert_hits[layer_idx][e] += 1u;
         int ps = v2p[e];
         if (ps >= 0) {
             protect[ps] = 1;

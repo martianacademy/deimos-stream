@@ -88,6 +88,7 @@ struct DeimosArenaManager {
     std::vector<std::vector<int32_t>>  phys_to_virt;
     std::vector<std::vector<int32_t>>  slot_freq;
     std::vector<std::vector<uint32_t>> expert_freq;
+    std::vector<std::vector<uint32_t>> total_expert_hits;
     std::vector<std::vector<int64_t>>  slot_step;
     std::vector<std::vector<uint64_t>> slot_gen;
     std::vector<std::vector<uint8_t>>  prefetched_flag;

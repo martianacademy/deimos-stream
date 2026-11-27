@@ -21,10 +21,8 @@ try:
 except ImportError:
     mx = None  # type: ignore[assignment]
 
-from deimos_stream.merkle_builder import (
-    compile_deimos_dylib,
-    compute_q4_leaf_layout,
-)
+from deimos_stream.heat_profile import save_arena_heat, seed_arena_from_heat
+from deimos_stream.merkle_builder import compile_deimos_dylib, compute_q4_leaf_layout
 
 
 class DeimosMerkleIntegrityError(RuntimeError):
@@ -377,6 +375,8 @@ class PagedExpertArena:
                 raise DeimosMerkleIntegrityError("Corrupted Q4 Merkle leaf detected during preload!")
             if rc != 0:
                 raise RuntimeError(f"deimos_arena_preload_all failed (rc={rc})")
+        else:
+            seed_arena_from_heat(self, stage_bound_pools=True)
 
     def resolve_and_prefetch(
         self,
@@ -481,6 +481,7 @@ class PagedExpertArena:
 
     def close(self) -> None:
         if self.arena_handle:
+            save_arena_heat(self)
             self.bridge.lib.deimos_arena_destroy(self.arena_handle)
             self.arena_handle = None
         self._views_keepalive.clear()

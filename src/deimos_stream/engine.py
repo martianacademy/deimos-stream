@@ -391,7 +391,9 @@ class DeimosPagedMoEEngine:
 
         self.arena.reset_telemetry()
         t_dec = time.perf_counter()
-        gen_ids = list(iter_decode_tokens(self, logits, caches, max_new_tokens + 1))
+        gen_ids = list(
+            iter_decode_tokens(self, logits, caches, max_new_tokens + 1, prompt_ids=prompt_ids)
+        )
         decode_sec = max(1e-6, time.perf_counter() - t_dec)
         self.arena.wait_idle()
 

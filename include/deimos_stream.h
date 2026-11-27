@@ -194,6 +194,14 @@ int deimos_arena_bind_layer_ptrs(
 
 int deimos_arena_preload_all(void* arena_handle);
 int deimos_arena_mark_preloaded_prefix(void* arena_handle, int count);
+int deimos_arena_export_expert_hits(void* arena_handle, uint32_t* out_hits, int max_elements);
+int deimos_arena_seed_warm_slots(
+    void*           arena_handle,
+    const int32_t*  warm_expert_ids,
+    const int32_t*  init_slot_freqs,
+    const uint32_t* init_expert_freqs,
+    int             stage_bound_pools
+);
 
 int deimos_arena_resolve_and_prefetch(
     void*          arena_handle,

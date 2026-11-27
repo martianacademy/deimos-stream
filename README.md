@@ -7,7 +7,7 @@
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-brightgreen.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/martianacademy/deimos-stream/blob/main/LICENSE)
 
-**DeimosStream (`v0.8.0`)** is a universal low-VRAM **Sparse Mixture-of-Experts (MoE) LLM streaming engine** — the language-model twin to [**PhobosStream**](https://github.com/martianacademy/phobos-stream) — built to run **2026 Frontier Sparse & Hybrid MoE models** (**`Qwen3.6 / Qwen3.8 Hybrid`**, **`DeepSeek-V4-Flash / V3.2 / R1`**, **`GLM-5.3-Flash / GLM-4.7-Flash`**, **`MiniMax-M3.1-Flash`**, **`Kimi-K3 / K2.5 / Kimi-Linear`**, **`LiquidAI LFM2.5-MoE`**, **`Ling-3.2`**, **`Llama-4`**) faster than **`llama.cpp` (`--n-cpu-moe`)** and **`mlx-lm`** inside strictly bounded GPU & Host memory, with **zero quality loss (`--tau 1.0` exact routing)** and optional **cryptographic SHA-256 Merkle proof verification (`DEIMIDX2`)** on every cold expert page.
+**DeimosStream (`v0.9.0`)** is a universal low-VRAM **Sparse Mixture-of-Experts (MoE) LLM streaming engine** — the language-model twin to [**PhobosStream**](https://github.com/martianacademy/phobos-stream) — built to run **2026 Frontier Sparse & Hybrid MoE models** (**`Qwen3.6 / Qwen3.8 Hybrid`**, **`DeepSeek-V4-Flash / V3.2 / R1`**, **`GLM-5.3-Flash / GLM-4.7-Flash`**, **`MiniMax-M3.1-Flash`**, **`Kimi-K3 / K2.5 / Kimi-Linear`**, **`LiquidAI LFM2.5-MoE`**, **`Ling-3.2`**, **`Llama-4`**) faster than **`llama.cpp` (`--n-cpu-moe`)** and **`mlx-lm`** inside strictly bounded GPU & Host memory, with **zero quality loss (`--tau 1.0` exact routing)** and optional **cryptographic SHA-256 Merkle proof verification (`DEIMIDX2`)** on every cold expert page.
 
 By combining **Native `nvcc` `sm_61+` `__dp4a` CUDA Q4/INT8 Kernels** (`238 GB/s` INT8 GEMV • `222 GB/s` Q4 dense GEMV • `137 GB/s` gathered paged Q4 SwiGLU on Tesla T4), **81-Segment Static CUDA Graphs** with zero-spill Triton `GatedDeltaNet` recurrent state updates, a **Zero-PCIe C++17 `Q8_1 × Q4` `AVX2/NEON` Hybrid Miss Engine** with disjoint `< 24 GiB` `madvise(MADV_DONTNEED)` Host page-cache management, and **Compiled Apple Silicon `MLX` Metal Decode (`@mx.compile` + `mx.async_eval`)**, DeimosStream achieves at **exact `tau=1.0` routing**:
 * **306B `zai-org/GLM-5.3-Flash` (`305.78 GiB` FP8, `12,096` experts) on a single 15 GB T4 & 24 GB A10 GPU:**
@@ -22,7 +22,30 @@ By combining **Native `nvcc` `sm_61+` `__dp4a` CUDA Q4/INT8 Kernels** (`238 GB/s
 
 ---
 
-## 🏆 Verified Head-to-Head Benchmarks (`v0.6.0`, Exact `tau=1.0`, Zero Quality Loss)
+## 🏆 Verified Head-to-Head Benchmarks (Exact `tau=1.0`, Zero Quality Loss)
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/martianacademy/deimos-stream/main/assets/benchmark_comparison_dark.png" />
+    <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/martianacademy/deimos-stream/main/assets/benchmark_comparison.png" />
+    <img src="https://raw.githubusercontent.com/martianacademy/deimos-stream/main/assets/benchmark_comparison.png" width="100%" alt="DeimosStream Consumer Hardware Performance Overview (Speed & First-Reply Latency)" />
+  </picture>
+</p>
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/martianacademy/deimos-stream/main/assets/technical_benchmarks_dark.png" />
+    <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/martianacademy/deimos-stream/main/assets/technical_benchmarks.png" />
+    <img src="https://raw.githubusercontent.com/martianacademy/deimos-stream/main/assets/technical_benchmarks.png" width="100%" alt="Technical Performance Across MoE Inference Engines (DeimosStream vs Colibri vs llama.cpp vs mlx-lm)" />
+  </picture>
+</p>
+
+> **Engineering Trade-Off Summary:** Choose **[`Colibri`](https://github.com/JustVugg/colibri) (`Apache-2.0`)** or **`llama.cpp` (`MIT`)** when you need a zero-Python C/C++ binary, AMD/Intel **Vulkan** GPUs, or aggressive **`1–2 bit` (`IQ1_S` / `IQ2_XXS`)** GGUF compression to trade perplexity for minimum disk reads on NVMe-bound rigs. Choose **`DeimosStream` (`MIT`)** when you want **strictly lossless `tau=1.0` 4-bit / zero-copy `FP8` / `FP16` quality**, **maximum Apple Silicon `MLX` & budget `8–24 GB` NVIDIA `CUDA` throughput**, **minute-scale GPU streaming conversion (or zero-conversion raw `.safetensors` `FP8`)**, and **cryptographic `DEIMIDX2` Merkle verification**.
+
+<details>
+<summary><b>📊 Expand Full Reproducible Telemetry Tables (VRAM, Host RSS, TTFT, WikiText-2 PPL & 4-Engine Matrix)</b></summary>
+
+<br />
 
 ### 1. NVIDIA Tesla T4 (`15 GB` VRAM, Turing `sm_75`) — 35B `Qwen/Qwen3.6-35B-A3B` (`66.97 GiB` BF16, `10,240` Experts)
 
@@ -80,7 +103,41 @@ By combining **Native `nvcc` `sm_61+` `__dp4a` CUDA Q4/INT8 Kernels** (`238 GB/s
 
 ---
 
-## 🏛️ System Architecture (`v0.8.0`)
+### 3. Single-GPU & Capped-RAM 306B Frontier MoE — `zai-org/GLM-5.3-Flash` (`305.8 GiB` FP8, `12,096` Experts)
+
+*Same-prompt greedy (`temp=0`, `tau=1.0`) cloud head-to-head (`64` tokens, `24` vCPUs) vs upstream `llama.cpp` (`UD-Q4_K_XL`, `185.99 GiB`):*
+
+| Hardware Envelope & Engine | Status | Peak GPU VRAM | Host RSS (`GiB`) | Prefill TTFT | Decode Speed |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **`24 GB A10` (`224 GiB` RAM) • DeimosStream (`--backbone q4 --slots auto` \[19\])** | **OK** | `17.0 GiB` | **`164.81`** | **`23.00 s`** *(`3.55×`)* | **`3.44 tok/s`** *(`+17.8%`)* |
+| **`24 GB A10` (`224 GiB` RAM) • DeimosStream (`--backbone fp16 --slots 8`)** *(16-bit BB!)* | **OK** | `19.5 GiB` | **`164.57`** | **`29.26 s`** | **`3.31 tok/s`** |
+| `24 GB A10` (`224 GiB` RAM) • `llama.cpp UD-Q4_K_XL --n-cpu-moe 42` | **CUDA OOM** | `20.9 GiB req` | `187.66` | — | — |
+| `24 GB A10` (`224 GiB` RAM) • `llama.cpp UD-Q4_K_XL --n-cpu-moe 45` | OK | `12.0 GiB` | `187.66` | `81.65 s` | `2.92 tok/s` |
+| **`112 GiB` Hard-Capped RAM (`24 GB A10`) • DeimosStream (`--slots auto` \[21\])** | **OK** | `18.0 GiB` | **`112.86`** *(`-74.8 GiB`)* | **`46.24 s`** *(`3.17×`)* | **`2.14 tok/s`** *(`2.10×`)* |
+| `112 GiB` Hard-Capped RAM (`24 GB A10`) • `llama.cpp --n-cpu-moe 45` | OK | `10.9 GiB` | `187.66` | `146.48 s` | `1.02 tok/s` |
+| **`15 GB Tesla T4` (`224 GiB` RAM) • DeimosStream (`--backbone q4 --slots 8`)** | **OK** | **`10.7 GiB`** | **`164.57`** | **`81.45 s`** | `2.27 tok/s` *(4.5-bpw Q4)* |
+
+---
+
+### 4. Open-Source MoE Engine Comparison (`DeimosStream` vs `Colibri` vs `llama.cpp` vs `mlx-lm`)
+
+*All competitor figures below are cited directly from our reproducible same-host runs above or from [`JustVugg/colibri`](https://github.com/JustVugg/colibri)'s (`Apache-2.0`) published documentation (`README.md`, `docs/benchmarks.md`, `docs/glm53-flash.md`, `docs/qwen36-cuda-tier.md`):*
+
+| Capability / Benchmark Dimension | **DeimosStream (`MIT`)** | **Colibri (`Apache-2.0`)** | **llama.cpp (`MIT`)** | **mlx-lm (`MIT`)** |
+| :--- | :--- | :--- | :--- | :--- |
+| **MoE Offload Granularity** | **Sub-layer TinyLFU GPU slots** (`1..E` per layer) + `.deimos_heat` warm profile | **Sub-layer LFRU GPU/RAM/NVMe tier** + `.coli_usage` heat profile | Whole-layer static split (`--n-cpu-moe`) | All-resident Unified Memory (no expert paging) |
+| **Apple Silicon (`M4 Max` Metal)** | **`422.0 tok/s`** (`OLMoE` Q4, `17.5 ms` TTFT); **`75.7–131.8 tok/s`** paged in `0.66–1.93 GiB`; **`287–302 GB/s`** zero-copy Metal `FP8` | Experimental Metal (`1.895 tok/s` published on `128 GB M4 Max` `GLM-5.3-Flash` `int4-g64` w/ 2 SSDs) | `363.2 tok/s` (`OLMoE` `Q4_K_M`, `34.8 ms` TTFT) | `411.5 tok/s` (`OLMoE` Q4, `74.1 ms` TTFT; OOMs if model > RAM) |
+| **`8–16 GB` GPU (`35B Qwen3.6` Exact 4-Bit)** | **`38.84 tok/s`** (`6.4 GiB` T4), **`29.89 tok/s`** (`2.7 GiB` T4), **`43.28 tok/s`** (`12.7 GiB` T4) | `25.4–30.0 tok/s` (`8 GB RTX 3070` `int4`), `17–19 tok/s` (`16 GB V100`); `104.8 tok/s` full-VRAM `24 GB RTX PRO 4000` | `28.94 tok/s` (`7.0 GiB` T4), `28.15 tok/s` (`2.8 GiB`), `35.15 tok/s` (`11.2 GiB`) | macOS Metal only |
+| **`306B GLM-5.3-Flash` Conversion & Disk** | **Zero-copy raw `.safetensors` `FP8` (`0 GB` extra)** OR **minutes** GPU chunked -> **`175.6 GiB`** Q4 | **`25 hours`** ref conversion -> `194.7 GB` `int4-g64` (or direct GGUF import) | Requires pre-built `186 GiB` `GGUF` | Requires full RAM conversion |
+| **Cryptographic Weight Proofs** | **Two-tier SHA-256 + XOR Merkle (`DEIMIDX2`)** on cold pages | None | None | None |
+| **Speculative / Multi-Token Decode** | **Lossless `--speculative`** (`SuffixNgram` + `mtp_drafter` exact verification across KV & recurrent caches) | Native `MTP` draft heads + prompt lookup | External `--model-draft` / speculative CLI | External prompt/draft model |
+| **Architecture & Hardware Trade-off** | Modular Python + C++17 + CUDA + MLX (`< 500` LOC/file); Day-0 HF `meta`-skeleton adapter; strict `4-bit`/`FP8`/`FP16` quality | Standalone pure-C runtime, **Vulkan** (AMD/Intel/iGPU/Windows), built-in Web/TUI heatmap, & **`1–3 bit` (`IQ1_S`/`IQ2_XXS`) GGUF** for extreme size compression | Standalone C++ runtime; broadest CPU/Vulkan/SYCL/GGUF ecosystem | Pure Apple Silicon MLX reference library |
+
+</details>
+
+---
+
+## 🏛️ System Architecture (`v0.9.0`)
 
 ```mermaid
 flowchart TD
@@ -117,8 +174,10 @@ flowchart TD
    - Cgroup v1/v2 (`/proc/self/cgroup` + `sched_getaffinity`) thread & memory budgeting prevents container CFS throttling, and direct Linux `madvise(MADV_DONTNEED)` evicts GPU-staged experts from Host RAM on `< 24 GiB` hosts so `15 GiB VRAM + 12 GiB RAM` holds all `17.2 GiB` of 35B MoE experts without disk thrashing.
 4. **Universal `DEIMIDX2` Cryptographic Merkle Store (`deimos_merkle.mm`) & Compiled Apple Silicon `MLX` Engine (`engine.py`, `mlx_hybrid.py`, `mlx_universal.py`)**:
    - Identical `DEIMIDX2` store runs natively on **Apple Silicon MLX** (`@mx.compile` paged SwiGLU + `mx.async_eval` pipelining + `F_NOCACHE` preload + universal `DeimosMLXSwitchGLU`) and **NVIDIA CUDA** with optional SHA-256 leaf verification (`DeimosMerkleIntegrityError` on any 1-bit disk corruption) and `O(1)` Robin-Hood Merkle KV-prefix caching (`4.29×` faster warm multi-turn TTFT).
-5. **Trait-Based Universal MoE Adapter (`model_adapters.py`)**:
-   - Automatically discovers mixed dense + MoE layer schedules (`first_k_dense_replace`, `moe_layers`, `mlp_only_layers`), dequantizes `[128,128]`/`[32,32]` block-scaled `FP8 E4M3` (`weight_scale_inv`) checkpoints on the fly during conversion, transposes 3D `Llama-4` `[E, D, 2I]` experts into `O(top_k)` sparse paging, and exposes `DeimosQ4Linear` (`--backbone q4`) across generic `transformers` backbones.
+5. **Trait-Based Universal MoE Adapter & Zero-Copy Native `FP8` Engine (`model_adapters.py`, `fp8_engine.py`)**:
+   - Automatically discovers mixed dense + MoE layer schedules (`first_k_dense_replace`, `moe_layers`, `mlp_only_layers`), supports clamped & `SwiGLU-OAI` activations (`GLM-5.3`, `DeepSeek-V4`, `MiniMax-M3.1`), and streams raw multi-shard `FP8 E4M3` / `UE8M0` `.safetensors` checkpoints directly with **zero extra disk space** (`287–302 GB/s` custom Metal LUT kernel on Apple Silicon).
+6. **Persistent `.deimos_heat` Warm Slot Profile & Lossless `--speculative` / MTP Decode (`heat_profile.py`, `speculative.py`)**:
+   - Persists EMA-decayed per-layer expert routing heat across sessions (`2.76×` faster warm TTFT at `0.0` logit drift) and verifies multi-token `SuffixNgram` / `MTP` drafts in a single coalesced pass with exact Leviathan rejection sampling and hybrid recurrent-cache rollback.
 
 ---
 

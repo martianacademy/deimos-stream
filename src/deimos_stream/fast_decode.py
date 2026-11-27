@@ -17,7 +17,9 @@ DeimosStream Fast Decode Paths (`src/deimos_stream/fast_decode.py`)
 
 from __future__ import annotations
 
-from typing import Any, Collection, Iterator, List, Optional
+from typing import Any, Collection, Iterator, List, Optional, Sequence
+
+from deimos_stream.speculative import iter_speculative_tokens
 
 try:
     import mlx.core as mx
@@ -48,12 +50,25 @@ def iter_decode_tokens(
     max_new_tokens: int,
     temperature: float = 0.0,
     stop_ids: Optional[Collection[int]] = None,
+    prompt_ids: Optional[Sequence[int]] = None,
 ) -> Iterator[int]:
     """Yields up to `max_new_tokens` ids, starting from the prefill `logits`.
 
     Close the generator (`gen.close()`) as soon as you stop consuming it, so the KV caches
     are trimmed before they are saved or reused.
     """
+    if getattr(eng, "enable_speculative", False):
+        yield from iter_speculative_tokens(
+            eng,
+            logits,
+            caches,
+            prompt_ids or (),
+            max_new_tokens,
+            temperature=temperature,
+            stop_ids=stop_ids,
+            max_draft=int(getattr(eng, "spec_max_draft", 4)),
+        )
+        return
     stops = stop_ids or ()
     if not supports_pipeline(eng):
         tok = eng.sample_next_token(logits, temperature=temperature)

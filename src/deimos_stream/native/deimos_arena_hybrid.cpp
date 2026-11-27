@@ -57,6 +57,7 @@ int deimos_arena_resolve_ring_batch(
         int e = routed_ids[i];
         if (e < 0 || e >= mgr->num_experts) return DEIMOS_ERR_INVALID_ARG;
         efreq[e] += 1u;
+        if (mgr->total_expert_hits[layer_idx][e] < 0x3fffffffU) mgr->total_expert_hits[layer_idx][e] += 1u;
         int ps = v2p[e];
         if (ps >= 0) {
             protect[ps] = 1;
@@ -134,6 +135,7 @@ int deimos_arena_resolve_hybrid_decode(
         int e = work_ids[i];
         if (e < 0 || e >= mgr->num_experts) return DEIMOS_ERR_INVALID_ARG;
         if (efreq[e] < 64u) efreq[e] += 1u;
+        if (mgr->total_expert_hits[layer_idx][e] < 0x3fffffffU) mgr->total_expert_hits[layer_idx][e] += 1u;
         int ps = v2p[e];
         if (ps >= 0) {
             protect[ps] = 1;
@@ -183,6 +185,82 @@ int deimos_arena_resolve_hybrid_decode(
     *out_num_hits   = n_hits;
     *out_num_misses = n_miss;
     *out_num_promos = n_promos;
+    return DEIMOS_OK;
+}
+
+int deimos_arena_export_expert_hits(void* arena_handle, uint32_t* out_hits, int max_elements) {
+    if (!arena_handle || !out_hits || max_elements <= 0) return DEIMOS_ERR_INVALID_ARG;
+    auto* mgr = static_cast<DeimosArenaManager*>(arena_handle);
+    mgr->wait_idle();
+    const int total = mgr->num_layers * mgr->num_experts;
+    if (max_elements < total) return DEIMOS_ERR_BOUNDS;
+    for (int l = 0; l < mgr->num_layers; ++l) {
+        std::memcpy(
+            out_hits + static_cast<size_t>(l) * static_cast<size_t>(mgr->num_experts),
+            mgr->total_expert_hits[l].data(),
+            static_cast<size_t>(mgr->num_experts) * sizeof(uint32_t)
+        );
+    }
+    return DEIMOS_OK;
+}
+
+int deimos_arena_seed_warm_slots(
+    void*           arena_handle,
+    const int32_t*  warm_expert_ids,
+    const int32_t*  init_slot_freqs,
+    const uint32_t* init_expert_freqs,
+    int             stage_bound_pools
+) {
+    if (!arena_handle || !warm_expert_ids || !init_slot_freqs || !init_expert_freqs) {
+        return DEIMOS_ERR_INVALID_ARG;
+    }
+    auto* mgr = static_cast<DeimosArenaManager*>(arena_handle);
+    mgr->wait_idle();
+
+    const int S = mgr->slots_per_layer;
+    const int E = mgr->num_experts;
+    std::vector<int32_t> slot_seq(static_cast<size_t>(S));
+    for (int s = 0; s < S; ++s) slot_seq[s] = s;
+
+    int saved_nc = mgr->use_nocache_pread;
+#if defined(__APPLE__)
+    if (stage_bound_pools) mgr->use_nocache_pread = 1;
+#endif
+
+    for (int l = 0; l < mgr->num_layers; ++l) {
+        const int32_t*  w_ids = warm_expert_ids + static_cast<size_t>(l) * static_cast<size_t>(S);
+        const int32_t*  s_frq = init_slot_freqs + static_cast<size_t>(l) * static_cast<size_t>(S);
+        const uint32_t* e_frq = init_expert_freqs + static_cast<size_t>(l) * static_cast<size_t>(E);
+
+        std::fill(mgr->virt_to_phys[l].begin(), mgr->virt_to_phys[l].end(), -1);
+        std::fill(mgr->phys_to_virt[l].begin(), mgr->phys_to_virt[l].end(), -1);
+        std::fill(mgr->prefetched_flag[l].begin(), mgr->prefetched_flag[l].end(), 0);
+        mgr->free_slots[l].clear();
+
+        for (int e = 0; e < E; ++e) {
+            mgr->expert_freq[l][e] = std::min<uint32_t>(e_frq[e], 48u);
+        }
+        for (int s = 0; s < S; ++s) {
+            int e = w_ids[s];
+            if (e < 0 || e >= E || mgr->virt_to_phys[l][e] >= 0) {
+                mgr->use_nocache_pread = saved_nc;
+                return DEIMOS_ERR_INVALID_ARG;
+            }
+            mgr->virt_to_phys[l][e] = s;
+            mgr->phys_to_virt[l][s] = e;
+            mgr->slot_freq[l][s]    = std::max<int32_t>(0, std::min<int32_t>(s_frq[s], 48));
+            mgr->slot_step[l][s]    = 0;
+            mgr->slot_gen[l][s]     = ++mgr->gen_clock;
+        }
+        if (stage_bound_pools && mgr->ptrs[l].gu_w) {
+            int rc = mgr->stage_layer_experts(l, w_ids, slot_seq.data(), S);
+            if (rc != DEIMOS_OK) {
+                mgr->use_nocache_pread = saved_nc;
+                return rc;
+            }
+        }
+    }
+    mgr->use_nocache_pread = saved_nc;
     return DEIMOS_OK;
 }
 

@@ -245,7 +245,9 @@ def create_deimos_app(
                 finish_reason = "length"
                 t_dec = time.perf_counter()
 
-                gen = iter_decode_tokens(eng, logits, caches, max_new, req.temperature, stop_ids)
+                gen = iter_decode_tokens(
+                    eng, logits, caches, max_new, req.temperature, stop_ids, prompt_ids=prompt_ids
+                )
                 try:
                     for tok_id in gen:
                         gen_ids.append(tok_id)

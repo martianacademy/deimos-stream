@@ -23,6 +23,7 @@ from deimos_stream.arena import (
     DeimosMerkleIntegrityError,
     _CArenaTelemetry,
 )
+from deimos_stream.heat_profile import save_arena_heat, seed_arena_from_heat
 from deimos_stream.memory_budget import _linux_available_bytes, _linux_total_ram_bytes
 from deimos_stream.merkle_builder import compute_q4_leaf_layout
 from deimos_stream.torch_moe_exec import bind_hybrid_c_api, execute_torch_moe_layer
@@ -188,21 +189,34 @@ class TorchPagedExpertArena:
             stride_b = int(self.bridge.header.expert_stride_bytes)
             cas_total = self.num_layers * self.num_experts * stride_b
             self._evict_host_on_stage = bool(total_ram is not None and total_ram < (cas_total + 6 * 1024**3))
-            warm_ids = list(range(self.slots_per_layer))
-            for l_idx in range(self.num_layers):
-                self._stage_via_ring(
-                    l_idx, warm_ids, warm_ids, wait_compute_first=False, block_compute_after=True, force_cached=True
-                )
-            torch.cuda.synchronize(self.device)
-            self._ring_events = [None] * self._ring_slots
-            self.bridge.lib.deimos_arena_mark_preloaded_prefix(self.arena_handle, self.slots_per_layer)
+            warm_2d = seed_arena_from_heat(self, stage_bound_pools=False)
+            slot_seq = list(range(self.slots_per_layer))
+            if warm_2d is not None:
+                for l_idx in range(self.num_layers):
+                    self._stage_via_ring(
+                        l_idx, warm_2d[l_idx].tolist(), slot_seq,
+                        wait_compute_first=False, block_compute_after=True, force_cached=True,
+                    )
+                torch.cuda.synchronize(self.device)
+                self._ring_events = [None] * self._ring_slots
+            else:
+                for l_idx in range(self.num_layers):
+                    self._stage_via_ring(
+                        l_idx, slot_seq, slot_seq,
+                        wait_compute_first=False, block_compute_after=True, force_cached=True,
+                    )
+                torch.cuda.synchronize(self.device)
+                self._ring_events = [None] * self._ring_slots
+                self.bridge.lib.deimos_arena_mark_preloaded_prefix(self.arena_handle, self.slots_per_layer)
             if self._evict_host_on_stage and total_ram is not None:
                 ram_b = max(0, total_ram - int(4.2 * 1024**3))
-                start_e = self.slots_per_layer
+                start_e = self.slots_per_layer if warm_2d is None else 0
                 end_e = min(self.num_experts, start_e + (ram_b // max(1, self.num_layers * stride_b)))
             else:
                 start_e, end_e = 0, self.num_experts
             self._deferred_warm_range = (start_e, end_e)
+        elif not self.is_cuda:
+            seed_arena_from_heat(self, stage_bound_pools=True)
 
     def warm_host_cache(self) -> None:
         """Prefaults non-GPU-resident CAS leaves into Host RAM & PTEs after backbone load completes."""
@@ -420,6 +434,7 @@ class TorchPagedExpertArena:
 
     def close(self) -> None:
         if self.arena_handle:
+            save_arena_heat(self)
             self.bridge.lib.deimos_arena_destroy(self.arena_handle)
             self.arena_handle = None
         self._ring = None
