@@ -181,6 +181,15 @@ inline float q4_dot_row_neon(
 }
 #endif
 
+inline float eval_swiglu_f32(float gate, float up, float limit, float alpha, float up_offset) {
+    if (limit > 0.0f) {
+        if (gate > limit) gate = limit;
+        if (up > limit) up = limit;
+        else if (up < -limit) up = -limit;
+    }
+    return (gate / (1.0f + std::exp(-alpha * gate))) * (up + up_offset);
+}
+
 #if defined(__x86_64__) || defined(_M_X64)
 inline bool cpu_has_avx2_fma_f16c() {
     static const bool supported = (__builtin_cpu_supports("avx2") &&
@@ -236,9 +245,11 @@ __attribute__((target("avx2,fma,f16c")))
 inline void phase1_avx2_q8_range(
     const uint8_t* const* leaf_ptrs, int I, int half_d, int ng_gu, int hg,
     const int8_t* q8e, const int8_t* q8o, const float* sxe, const float* sxo, const float* sum_x,
-    float* act_even, float* act_odd, int p0, int p1
+    float* act_even, float* act_odd, int p0, int p1,
+    float swiglu_limit = 0.0f, float swiglu_alpha = 1.0f, float swiglu_up_offset = 0.0f
 ) {
     const int half_i = I / 2;
+    const bool std_swiglu = (swiglu_limit <= 0.0f && swiglu_alpha == 1.0f && swiglu_up_offset == 0.0f);
     const size_t gu_w_bytes = static_cast<size_t>(2 * I) * static_cast<size_t>(half_d);
     const size_t gu_s_bytes = static_cast<size_t>(2 * I) * static_cast<size_t>(ng_gu) * 2u;
     const __m256i m4   = _mm256_set1_epi8(0x0F);
@@ -290,8 +301,12 @@ inline void phase1_avx2_q8_range(
             bu0_a += sbf[5] * ssum;
             bu1_a += sbf[7] * ssum;
         }
-        act_even[m * half_i + j] = fast_silu_avx2(hsum256_ps_avx2(vg0) + bg0_a) * (hsum256_ps_avx2(vu0) + bu0_a);
-        act_odd[m * half_i + j]  = fast_silu_avx2(hsum256_ps_avx2(vg1) + bg1_a) * (hsum256_ps_avx2(vu1) + bu1_a);
+        const float g0 = hsum256_ps_avx2(vg0) + bg0_a, u0 = hsum256_ps_avx2(vu0) + bu0_a;
+        const float g1 = hsum256_ps_avx2(vg1) + bg1_a, u1 = hsum256_ps_avx2(vu1) + bu1_a;
+        act_even[m * half_i + j] = std_swiglu ? (fast_silu_avx2(g0) * u0)
+                                              : eval_swiglu_f32(g0, u0, swiglu_limit, swiglu_alpha, swiglu_up_offset);
+        act_odd[m * half_i + j]  = std_swiglu ? (fast_silu_avx2(g1) * u1)
+                                              : eval_swiglu_f32(g1, u1, swiglu_limit, swiglu_alpha, swiglu_up_offset);
     }
 }
 

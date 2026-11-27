@@ -261,7 +261,10 @@ int deimos_cpu_q4_swiglu_forward(
     int            hidden_size,
     int            intermediate_size,
     int            group_size,
-    int            verify_on_cold
+    int            verify_on_cold,
+    float          swiglu_limit,
+    float          swiglu_alpha,
+    float          swiglu_up_offset
 );
 
 void deimos_warm_cpu_moe_pool(

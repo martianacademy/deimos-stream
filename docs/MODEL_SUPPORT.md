@@ -1,6 +1,6 @@
-# DeimosStream Universal MoE Model Support & Hardware Sizing Guide (`v0.7.0`)
+# DeimosStream 2026 Frontier MoE Model Support & Hardware Sizing Guide
 
-DeimosStream uses a **trait-based Universal MoE Adapter system** (`src/deimos_stream/model_adapters.py` and `src/deimos_stream/mlx_universal.py`) rather than maintaining separate per-model forks. You can inspect the live registry at any time via:
+DeimosStream uses a **trait-based Universal MoE Adapter system** ([`model_adapters.py`](../src/deimos_stream/model_adapters.py), [`model_catalog.py`](../src/deimos_stream/model_catalog.py), and [`mlx_universal.py`](../src/deimos_stream/mlx_universal.py)) purpose-built for **2026 Sparse & Hybrid MoE architectures**. Inspect the live registry anytime via:
 
 ```bash
 deimos-stream models
@@ -8,65 +8,53 @@ deimos-stream models
 
 ---
 
-## 1. How the Universal Adapter Works
+## 1. 2026 Frontier Architectural Primitives Handled Automatically
 
-Across modern HuggingFace `transformers` (`>= 5.0`) and Apple Silicon `mlx-lm`, 95% of Sparse and Hybrid MoE checkpoints share a common routed SwiGLU structure once four structural variations are normalized during `deimos-stream convert` and engine startup:
+Across late-2026 HuggingFace `transformers` (`>= 5.24`) and Apple Silicon `mlx-lm`, DeimosStream normalizes five structural variations during `deimos-stream convert` and engine startup:
 
-1. **Automatic Mixed Dense + MoE Layer Discovery (`moe_layer_ids`):**
-   Models such as `DeepSeek-V2/V3/R1` (`first_k_dense_replace = 1..3`), `GLM-4.5` (`first_k_dense_replace = 1`), `Llama-4 Maverick` (`interleave_moe_layer_step = 2`), `ERNIE-4.5-MoE` (`moe_layer_interval`), and `Jamba` mix dense MLP layers with routed MoE layers. `discover_hf_moe_layers()` inspects `weight_map` directly, packs **only** MoE layers into `cas_experts_q4.bin` (`merkle_tree.idx`), keeps dense MLP layers inside `hf_backbone.safetensors`, and automatically strips vision towers (`visual.*`, `vision_model.*`) and extra Multi-Token Prediction draft layers (`layers.{>= num_hidden_layers}`).
-2. **Block-Scaled `FP8 E4M3` Dequantization (`weight_scale_inv`):**
-   Frontier checkpoints published natively in `FP8` (`DeepSeek-V3`, `DeepSeek-R1`, `DeepSeek-V3.2`, `Kimi-K2`, `Qwen3-FP8`, `GLM-4.5-FP8`) store `float8_e4m3fn` weights paired with `[128, 128]` or `[32, 32]` `weight_scale_inv` tensors. `pop_tensor_dequant()` dequantizes these blocks on the fly during conversion into Group-64 Q4 `DEIMIDX2` Merkle leaves and FP16 `hf_backbone.safetensors`, removing `quantization_config` from the runtime `config.json`.
-3. **Canonical Expert Layout & `O(top_k)` Router Binding:**
-   Handles 2D per-expert shards (`gate_proj/up_proj/down_proj` or `w1/w3/w2`), 3D stacked `[E, 2I, D]` tensors, and transposed 3D `Llama-4` `[E, D, 2I]` / `[E, I, D]` tensors. On `Llama-4`, `bind_hf_moe_layer()` replaces HuggingFace's `O(num_experts)` dense `torch.bmm` repeat with `O(top_k)` sparse paged execution.
-4. **Dual Native Execution (`CUDA` + Apple Silicon `MLX`):**
-   - **NVIDIA CUDA / Linux (`DeimosHFHybridMoEEngine`):** Instantiates any `AutoModelForCausalLM` skeleton on `torch.device("meta")` (`0` bytes RAM), binds `DeimosPagedHFExperts` (`__dp4a` CUDA Q4 + zero-PCIe C++17 `AVX2` miss engine), and supports `--backbone q4` via `DeimosQ4Linear`.
-   - **Apple Silicon Metal (`DeimosMLXUniversalMoEEngine` & `DeimosMLXHybridMoEEngine`):** Resolves the native `mlx_lm.models.<arch>` class (`MLA`, `GatedDeltaNet`, `Mamba2`, `ChunkedKVCache`, `YaRN`), swaps every `SwitchGLU` layer before `mx.eval` (`0` bytes allocated for unpaged experts) with `DeimosMLXSwitchGLU` (`mx.gather_qmm`), and runs `model.sanitize()` (splitting `MLA` `kv_b_proj` automatically).
+1. **Clamped & Alpha-Scaled SwiGLU (`swiglu_limit`, `swiglu_alpha`, `up + 1`):**
+   - **Standard SwiGLU (`Qwen3.6 / Qwen3.8`, `Kimi-K3 / K2.5`, `LiquidAI LFM2.5-MoE`, `GLM-4.7-Flash`, `Ling-3.2`):** `silu(gate) * up`
+   - **Clamped SwiGLU (`DeepSeek-V4-Flash`, `GLM-5.3-Flash`, `HY4-Flash`):** `silu(min(gate, 10.0)) * clamp(up, -10.0, 10.0)`
+   - **SwiGLU-OAI (`MiniMax-M3.1-Flash`, `MiniMax-M3`):** `min(gate, 7.0) * sigmoid(1.702 * min(gate, 7.0)) * (clamp(up, -7.0, 7.0) + 1.0)`
+   Supported natively across **CUDA `__dp4a` (`deimos_cuda_q4.cu`)**, **Triton (`triton_q4.py`)**, **C++17 `AVX2/NEON` (`deimos_cpu_moe.cpp`)**, and **Apple Silicon `MLX` (`DeimosMLXSwitchGLU`)**.
+2. **`UE8M0` (`.scale`) & Block-Scaled `FP8 E4M3` (`.weight_scale_inv`) Dequantization:**
+   Automatically decodes power-of-two `float8_e8m0fnu` / `uint8` `E8M0` scales (`DeepSeek-V4-Flash` `layers.*.ffn.experts.*.w1.{weight,scale}`, `MXFP8`) and `float32` block scales (`GLM-5.3-Flash`, `Qwen3.6/3.8-FP8`, `DeepSeek-V3/V3.2`) into Group-64 Q4 `DEIMIDX2` Merkle leaves.
+3. **Mixed Dense + MoE Layer Discovery (`moe_layer_ids`):**
+   Scans `mlp`, `feed_forward`, `block_sparse_moe`, and `ffn` containers (`first_k_dense_replace`, `num_dense_layers`, `mlp_layer_types`, `moe_layers`), keeping dense prefix layers in `hf_backbone.safetensors` while stripping vision towers and MTP draft heads.
+4. **`transformers` 5.x `conversion_mapping` & Multimodal Text Extraction:**
+   Uses `convert_and_load_state_dict_in_model` on `meta`-device skeletons (`0` bytes host RAM for unpaged experts) and automatically extracts the language backbone from multimodal MoEs (`GLM-5.3-Flash` `Glm5NextForConditionalGeneration`, `Qwen3.8-Flash-Next`, `MiniMax-M3.1-Flash`).
+5. **Dual Native Execution (`CUDA` + Apple Silicon `MLX`):**
+   Runs one unified `DEIMIDX2` store on **NVIDIA CUDA** (`__dp4a` Q4 + zero-PCIe C++17 `AVX2` miss engine) and **Apple Silicon Metal** (`DeimosMLXHybridMoEEngine` & `DeimosMLXUniversalMoEEngine` `mx.gather_qmm`).
 
 ---
 
-## 2. Supported Model Families & Hardware Requirements
-
-All models convert with the same command (pass either a HuggingFace repo ID or a local directory):
+## 2. 2026 Frontier Model Matrix & Hardware Sizing
 
 ```bash
 deimos-stream convert --model-dir <repo_id_or_local_dir> --output-dir ./my_deimos_store
 deimos-stream chat --store-dir ./my_deimos_store --backbone q4 --tau 1.0 --no-verify
 ```
 
-| Family | `model_type` | Attention & Routing | Representative Models | `DEIMIDX2` Disk Size | Minimum VRAM (`--slots 8..16`) | Recommended Host RAM (Fast Hybrid) |
+| 2026 Model Family | `model_type` | Attention & Routing | Representative 2026 Checkpoints | `DEIMIDX2` Store | Min GPU VRAM (`--slots 8..16`) | Recommended Host RAM |
 | :--- | :--- | :--- | :--- | :---: | :---: | :---: |
-| **OLMoE / Phi-MoE** | `olmoe`, `phimoe` | GQA (+ QK-Norm), Softmax Top-8/Top-2 | `allenai/OLMoE-1B-7B-0125-Instruct` (`7B`) | `3.4 GiB` | **`0.7 – 1.1 GiB`** | `8 – 16 GB` |
-| **DeepSeek-V2-Lite / Moonlight** | `deepseek_v2`, `deepseek_v3` | **MLA**, First-1 Dense, Softmax / NoAux Sigmoid Top-6 | `deepseek-ai/DeepSeek-V2-Lite-Chat` (`16B`), `moonshotai/Moonlight-16B-A3B-Instruct` | `~9.2 GiB` | **`2.2 – 3.2 GiB`** | `16 – 32 GB` |
-| **Qwen3-MoE (`30B`)** | `qwen3_moe`, `qwen2_moe` | GQA + QK-Norm, Softmax Top-8 (`128E`) | `Qwen/Qwen3-30B-A3B` (`30.5B`) | `~16.8 GiB` | **`2.6 – 4.2 GiB`** | `16 – 32 GB` |
-| **Qwen3.6 / 3.5 / Next Hybrid** | `qwen3_5_moe`, `qwen3_next` | **GatedDeltaNet + GQA**, Gated Shared Expert (`256E` Top-8) | `Qwen/Qwen3.6-35B-A3B` (`35B`), `Qwen/Qwen3-Next-80B-A3B` | `21.0 GiB` *(35B)* / `~44 GiB` *(80B)* | **`2.7 GiB`** *(35B, verified T4)* / **`~5.5 GiB`** *(80B)* | **`12 – 32 GB`** *(35B: `29–43 tok/s` T4)* / `64 GB` *(80B)* |
-| **Mixtral** | `mixtral` | GQA / SWA, Softmax Top-2 (`8E`) | `mistralai/Mixtral-8x7B-Instruct-v0.1` (`46.7B`) | `~23.5 GiB` | **`5.8 – 6.5 GiB`** | `32 – 64 GB` |
-| **GLM-4.5 / GLM-4.5-Air** | `glm4_moe`, `glm4_moe_lite` | Partial-RoPE GQA / MLA, First-1 Dense, NoAux Sigmoid Top-8 | `zai-org/GLM-4.5-Air` (`106B-A12B`) | `~58 GiB` | **`6.5 – 9.5 GiB`** | `64 – 128 GB` |
-| **Llama 4 (Scout & Maverick)** | `llama4`, `llama4_text` | Chunked GQA + iRoPE, Sigmoid Top-1 + Shared Expert | `Llama-4-Scout-17B-16E` (`109B`), `Llama-4-Maverick-17B-128E` (`400B`) | `~59 GiB` *(Scout)* / `~212 GiB` *(Maverick)* | **`8 – 12 GiB`** *(Scout)* / **`12 – 16 GiB`** *(Maverick)* | `64 – 128 GB` *(Scout)* / `256+ GB` *(Maverick)* |
-| **Qwen3-235B-A22B** | `qwen3_moe` | GQA + QK-Norm, Softmax Top-8 (`128E`, `94` layers) | `Qwen/Qwen3-235B-A22B` (`235B`) | `~122 GiB` | **`14 – 20 GiB`** | `128 – 256 GB` |
-| **DeepSeek-V3 / R1 / V3.2 / Kimi-K2** | `deepseek_v3`, `deepseek_v32` | **MLA + YaRN**, First-3 Dense, NoAux Sigmoid Top-8 (`256E`/`384E`), `FP8` shards | `deepseek-ai/DeepSeek-V3` (`671B`), `deepseek-ai/DeepSeek-R1`, `Kimi-K2` (`1T`) | `~355 GiB` *(671B)* / `~530 GiB` *(1T)* | **`16 – 24 GiB`** *(backbone + minimal slots)* | `64–128 GB` *(NVMe-paged ~1–3 tok/s)* / **`384–512 GB`** *(RAM-cached ~10–20+ tok/s)* |
-| **MiniMax / ERNIE-4.5 / Jamba / Granite** | `minimax_m2`, `ernie4_5_moe`, `jamba`, `granitemoehybrid` | GQA or Hybrid Mamba2-SSM + GQA, Interleaved MoE | `MiniMaxAI/MiniMax-M2`, `baidu/ERNIE-4.5-21B-A3B-PT`, `AI21-Jamba-1.5-Mini` | `12 – 120 GiB` | **`3 – 12 GiB`** | `16 – 128 GB` |
+| **LiquidAI LFM2.5-MoE** *(Oct 2026)* | `lfm2_moe` | Hybrid `LIV ShortConv` + QK-Norm GQA, Top-4 (`32E`/`64E`) | `LiquidAI/LFM2.5-8B-A1B`, `LiquidAI/LFM2.5-24B-A2B` | `~4.4 GiB` *(8B)* / `~12.5 GiB` *(24B)* | **`1.2 – 2.4 GiB`** | `8 – 24 GB` |
+| **GLM-4.7-Flash** *(2026)* | `glm4_moe_lite` | **MLA**, First-1 Dense, NoAux Sigmoid Top-4 (`64E`) | `zai-org/GLM-4.7-Flash` (`30B-A3B`) | `~16.2 GiB` | **`2.5 – 3.8 GiB`** | `16 – 32 GB` |
+| **Qwen3.6 / Qwen3.8 Hybrid** *(2026)* | `qwen3_5_moe`, `qwen4_exp_text` | **GatedDeltaNet + QSA/GQA**, Gated Shared Expert (`256E`/`512E`) | `Qwen/Qwen3.6-35B-A3B` (`35B`), `Qwen/Qwen3.8-Flash-Next` | **`21.0 GiB`** *(35B)* / `~92 GiB` *(3.8-Next)* | **`2.7 GiB`** *(35B, verified T4)* / `~9 GiB` | **`12 – 32 GB`** *(35B: `29–43 tok/s` T4)* / `96+ GB` |
+| **Kimi-K3 / K2.5 / Kimi-Linear** *(Nov 2026)* | `kimi_linear`, `kimi_k3`, `kimi_k25` | Hybrid **KDA** + **MLA**, NoAux Sigmoid (`256E`–`896E`) | `moonshotai/Kimi-Linear-48B-A3B-Instruct`, `moonshotai/Kimi-K2.5`, `moonshotai/Kimi-K3` | `~26 GiB` *(48B)* / `~310+ GiB` *(K2.5/K3)* | **`3.5 GiB`** *(48B)* / `16–24 GiB` *(K2.5/K3)* | `32 GB` *(48B)* / `128–512 GB` |
+| **Ling-3.2 / Bailing-MoE-V3** *(Nov 2026)* | `bailing_hybrid`, `bailing_moe_v3` | Hybrid **KDA** + **MLA**, Sigmoid Top-8 (`512E`) | `inclusionAI/Ling-3.2-air`, `inclusionAI/Ling-3.1-flash` | `~34 GiB` *(Air)* / `~145 GiB` *(Flash)* | **`4.5 – 12 GiB`** | `32 – 192 GB` |
+| **DeepSeek-V4-Flash** *(Aug 2026)* | `deepseek_v4` | **MLA + HCA/CSA + mHC**, `sqrtsoftplus` Top-6 (`256E`), `UE8M0`, `limit=10` | `deepseek-ai/DeepSeek-V4-Flash-0731` (`155B`) | `~82 GiB` | **`8 – 12 GiB`** | `64 – 128 GB` *(fits 128 GB M4 Max / Cloud VM)* |
+| **GLM-5.3-Flash / GLM-5.2** *(Aug 2026)* | `glm5_next` | Linear Attn + **DSA/MLA + mHC**, Sigmoid Top-8 (`288E`), `limit=10` | `zai-org/GLM-5.3-Flash` (`305B`), `zai-org/GLM-5.2` | `~160 GiB` | **`12 – 16 GiB`** | `64–128 GB` *(paged)* / `192+ GB` *(cached)* |
+| **MiniMax-M3.1-Flash / M3** *(Nov 2026)* | `minimax_m3_vl` | Sliding/Full GQA + `GemmaRMSNorm`, `SwiGLU-OAI` (`alpha=1.702, limit=7`) | `MiniMaxAI/MiniMax-M3.1-Flash`, `MiniMaxAI/MiniMax-M3` | `~220 GiB` | **`12 – 18 GiB`** | `128 – 256+ GB` |
+| **DeepSeek-V3.2 / R1 & Llama-4** | `deepseek_v32`, `deepseek_v3`, `llama4` | **MLA + YaRN** or Chunked iRoPE GQA | `deepseek-ai/DeepSeek-V3.2`, `Llama-4-Scout-17B-16E` (`109B`) | `~59 GiB` *(Scout)* / `~355 GiB` *(671B)* | **`8 – 20 GiB`** | `64 – 384+ GB` |
 
-*(Note: `OLMoE-1B-7B` on Apple M4 Max and `Qwen/Qwen3.6-35B-A3B` on NVIDIA Tesla T4 are measured full-checkpoint benchmarks; `DeepSeek-V3` (`FP8` + `MLA`), `GLM-4.5`, and `Llama-4` adapters are verified for forward & KV-cached decode parity (`Pearson r > 0.995`) in `tests/test_model_adapters.py`, with analytical memory envelopes derived from exact tensor dimensions.)*
-
----
-
-## 3. Roadmap Architectures (Not Yet Supported Out-of-the-Box)
-
-DeimosStream validates `config.json` before downloading shards (`validate_convertible_architecture`) and raises an immediate, descriptive error on checkpoints whose expert math differs from standard bias-free unclamped SwiGLU `DEIMIDX2` leaves:
-
-1. **`deepseek-ai/DeepSeek-V4.1-Flash` (`model_type: "deepseek_v41"` — `~748B` total: `552B` MoE + `196B` Engram):**
-   - **Why it needs dedicated extensions:** Uses a custom `20+20` Causal Encoder-Decoder (`CED`) + Compressed Sparse Attention 2 (`CSA2`), `NVFP4`/`UE8M0` `[32, 32]` expert quantization, clamped SwiGLU (`swiglu_limit = 10.0`), and two `384M`-row INT8 `Engram` conditional memory lookup tables (`~185 GiB` on layers `1` & `14`).
-   - **Expected Hardware Specs once supported:** `16–24 GB` GPU VRAM + **`1 TB` PCIe Gen4/Gen5 NVMe SSD** (`~500 GB` store, `Engram` `mmap`-streamed in `0 GiB` VRAM) + `64–128 GB` RAM (`~1.5–4 tok/s` SSD-paged) or `384–512 GB` RAM / Mac Studio `512 GB` (`~12–50+ tok/s`).
-2. **`openai/gpt-oss-20b` & `openai/gpt-oss-120b` (`model_type: "gpt_oss"`):**
-   - **Why it needs dedicated extensions:** Ships `MXFP4` expert blocks with **per-expert linear biases** (`gate_up_proj_bias`, `down_proj_bias`) and `alpha = 1.702` clamped SwiGLU (`swiglu_limit = 7.0`), whereas `DEIMIDX2` v2 expert leaves store bias-free Group-64 Q4 `(weight, scale, zero_bias)`.
+*(Legacy 2024–2025 models including `Qwen3-MoE`, `DeepSeek-V2`, `ERNIE-4.5-MoE`, `Jamba`, `Mixtral`, and `OLMoE` remain backward-compatible.)*
 
 ---
 
-## 4. Adding a New MoE Adapter (`< 30` Lines)
+## 3. Roadmap Formats (Validated Before Download)
 
-If a new HuggingFace / `mlx-lm` Sparse MoE model uses standard SwiGLU experts (`silu(gate) * up -> down`) without per-expert linear biases:
+`validate_convertible_architecture()` checks `config.json` upfront and gives an immediate explanation on three non-standard formats:
 
-1. **Check `discover_hf_moe_layers()` in `src/deimos_stream/model_adapters.py`:** If the model places experts under a new attribute name (beyond `mlp`, `feed_forward`, or `block_sparse_moe`), add that container name to the tuple.
-2. **Check `extract_layer_experts_gu_dn()`:** If 3D expert tensors are stored transposed (`[E, D, 2I]`), the shape check `(gu_t.shape[1] == hidden_size and gu_t.shape[2] == 2 * inter_size)` already auto-transposes them.
-3. **Check `bind_hf_moe_layer()`:** If `moe_mod.experts` already takes `(hidden_states, top_k_index, top_k_weights)`, no custom wrapper is needed; if the parent MoE block has a custom `shared_expert` or router signature, add a compact branch in `bind_hf_moe_layer()`.
-4. **Add an end-to-end parity test in `tests/test_model_adapters.py`** verifying `Pearson r > 0.995` on both `backend="cpu"` (`DeimosHFHybridMoEEngine`) and `backend="mlx"` (`DeimosMLXUniversalMoEEngine`), then register the family in `SUPPORTED_MOE_FAMILIES`.
+1. **`DeepSeek-V4.1-Flash` w/ `engram_layer_ids` (`deepseek_v41`, `748B`):** Standard `deepseek_v4` (`DeepSeek-V4-Flash-0731`, `155B`) works today; `V4.1` models with `engram_layer_ids` require `20+20` CED + `185 GiB` `mmap` hashed `Engram` tables.
+2. **`thinkingmachines/Inkling-2-Mini` (`inkling2_loop`):** Requires multi-turn looped decoder state with dual-tanh `Inkling2LoopSoftcappedSwiGLU`.
+3. **`openai/gpt-oss-20b` / `120b` (`gpt_oss`):** Uses per-expert linear biases (`gate_up_proj_bias`, `down_proj_bias`) outside bias-free `DEIMIDX2` Q4 leaves.

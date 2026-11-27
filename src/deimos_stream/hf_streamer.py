@@ -31,7 +31,11 @@ from deimos_stream.backbone import rss_mb
 from deimos_stream.engine import BenchmarkMetrics
 from deimos_stream.hf_cuda_graph import DeimosHFCudaGraphDecode, can_use_hf_cuda_graph
 from deimos_stream.hf_fast_patch import patch_hf_hybrid_for_cuda
-from deimos_stream.model_adapters import bind_hf_moe_layer
+from deimos_stream.model_adapters import (
+    bind_hf_moe_layer,
+    extract_swiglu_params,
+    load_hf_meta_skeleton,
+)
 from deimos_stream.torch_arena import HAS_TORCH, TorchPagedExpertArena
 from deimos_stream.triton_q4 import (
     quantize_2d_q4_torch,
@@ -231,7 +235,6 @@ class DeimosHFHybridMoEEngine:
     ):
         if not HAS_TORCH:
             raise RuntimeError("PyTorch & transformers required for DeimosHFHybridMoEEngine.")
-        from transformers import AutoConfig, AutoModelForCausalLM
 
         self.store_dir = Path(store_dir).expanduser().resolve()
         self.device = torch.device(device_str)
@@ -255,7 +258,9 @@ class DeimosHFHybridMoEEngine:
         self.num_experts = int(self.config["num_experts"])  # type: ignore[arg-type]
         self.hidden_size = int(self.config["hidden_size"])  # type: ignore[arg-type]
         self.vocab_size = int(self.config["vocab_size"])  # type: ignore[arg-type]
-        default_k = int(self.config.get("num_experts_per_tok", 8))  # type: ignore[arg-type]
+        default_k = int(
+            self.config.get("num_experts_per_tok") or self.config.get("num_experts_per_token") or 8  # type: ignore[arg-type]
+        )
         self.top_k = max(1, min(self.num_experts, int(top_k or default_k)))
         self.enable_lookahead = bool(enable_lookahead)
         self.enable_merkle_kv = False  # Hybrid recurrent GatedDeltaNet uses HF DynamicCache
@@ -269,15 +274,15 @@ class DeimosHFHybridMoEEngine:
             self.bridge, device=self.device, slots_per_layer=max(self.top_k, int(slots_per_layer)),
             verify_merkle_on_cold=verify_merkle_on_cold, use_nocache_pread=use_nocache_pread,
         )
+        self.arena.swiglu_limit, self.arena.swiglu_alpha, self.arena.swiglu_up_offset = extract_swiglu_params(
+            self.config
+        )
 
-        hf_cfg = AutoConfig.from_pretrained(str(self.store_dir), trust_remote_code=True)
-        text_cfg = getattr(hf_cfg, "text_config", hf_cfg)
-        text_cfg._attn_implementation = "sdpa"
-        text_cfg.dtype = self.compute_dtype
-
-        with torch.device("meta"):
-            model = AutoModelForCausalLM.from_config(text_cfg, trust_remote_code=True)
+        model, _, bb_path = load_hf_meta_skeleton(
+            self.store_dir, self.device, self.compute_dtype, self.backbone
+        )
         self._cache_kwarg = "cache" if "cache" in inspect.signature(model.forward).parameters else "past_key_values"
+        gc.collect()
 
         inner_lm = getattr(model.model, "language_model", model.model)
         self._mmap_emb = DeimosMmapEmbedding(
@@ -288,9 +293,6 @@ class DeimosHFHybridMoEEngine:
             self.store_dir / "lm_head_int8.bin", self.vocab_size, self.hidden_size,
             self.device, self.compute_dtype, use_q4=False,
         )
-        if hasattr(inner_lm, "rotary_emb"):
-            rot_cls = type(inner_lm.rotary_emb)
-            inner_lm.rotary_emb = rot_cls(config=text_cfg).to(self.device)
 
         paged_mods: List[DeimosPagedHFExperts] = []
         router_mods: List[Optional[nn.Module]] = []
@@ -299,21 +301,6 @@ class DeimosHFHybridMoEEngine:
             c_attr = self.moe_containers[a_i] if a_i < len(self.moe_containers) else "mlp"
             router_mods.append(bind_hf_moe_layer(inner_lm.layers[l_i], c_attr, pmod))
             paged_mods.append(pmod)
-
-        bb_path = self.store_dir / "hf_backbone.safetensors"
-        bb_tensors = st_load_torch(str(bb_path), device="cpu")
-        load_dev = torch.device("cpu") if (self.backbone == "q4" and self.device.type == "cuda") else self.device
-        casted_bb = {}
-        for k in list(bb_tensors.keys()):
-            v = bb_tensors.pop(k)
-            casted_bb[k] = (
-                v.to(device=load_dev, dtype=self.compute_dtype)
-                if v.is_floating_point() and v.dtype != torch.float32
-                else v.to(device=load_dev)
-            )
-        model.load_state_dict(casted_bb, strict=False, assign=True)
-        casted_bb.clear()
-        gc.collect()
 
         for a_i in range(len(paged_mods) - 1):
             if self.moe_layer_ids[a_i + 1] == self.moe_layer_ids[a_i] + 1 and router_mods[a_i + 1] is not None:

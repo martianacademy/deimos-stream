@@ -93,6 +93,21 @@ def parse_slots_arg(value: SlotsArg) -> SlotsArg:
 def store_layout(store_dir: Path) -> Tuple[int, int, int, int, int]:
     """Returns (num_layers, num_experts, expert_stride_bytes, fixed_device_bytes, top_k)."""
     sdir = Path(store_dir).expanduser().resolve()
+    if not (sdir / "merkle_manifest.json").exists():
+        from deimos_stream.fp8_safetensors import SafetensorsZeroCopyIndex, is_raw_fp8_moe_checkpoint
+
+        if is_raw_fp8_moe_checkpoint(sdir):
+            idx = SafetensorsZeroCopyIndex(sdir, use_nocache=False)
+            try:
+                return (
+                    idx.num_moe_layers,
+                    idx.num_experts,
+                    idx.expert_bytes,
+                    idx.fixed_backbone_bytes(compute_elem_bytes=2),
+                    idx.top_k,
+                )
+            finally:
+                idx.close()
     mf = json.loads((sdir / "merkle_manifest.json").read_text())
     num_layers = int(mf["num_layers"])
     num_experts = int(mf["num_experts_per_layer"])
@@ -243,14 +258,17 @@ def plan_slots(
     num_layers, num_experts, stride, fixed, cfg_top_k = store_layout(store_dir)
     if backbone == "q4":  # shared_core -> 4.5b, hybrid hf_backbone -> ~7.5b (INT8 SSM + Q4 Attn), lm_head -> 4.5b
         sdir = Path(store_dir).expanduser().resolve()
-        core = (sdir / "shared_core.bin").stat().st_size if (sdir / "shared_core.bin").exists() else 0
-        hf_bb = (
-            (sdir / "hf_backbone.safetensors").stat().st_size
-            if (sdir / "hf_backbone.safetensors").exists()
-            else 0
-        )
-        head = (sdir / "lm_head_int8.bin").stat().st_size if (sdir / "lm_head_int8.bin").exists() else 0
-        fixed -= (core + hf_bb + head) - int(core * 4.5 / 16) - int(hf_bb * 7.5 / 16) - int(head * 4.5 / 8)
+        if not (sdir / "merkle_manifest.json").exists():
+            fixed = int(fixed * 0.48)
+        else:
+            core = (sdir / "shared_core.bin").stat().st_size if (sdir / "shared_core.bin").exists() else 0
+            hf_bb = (
+                (sdir / "hf_backbone.safetensors").stat().st_size
+                if (sdir / "hf_backbone.safetensors").exists()
+                else 0
+            )
+            head = (sdir / "lm_head_int8.bin").stat().st_size if (sdir / "lm_head_int8.bin").exists() else 0
+            fixed -= (core + hf_bb + head) - int(core * 4.5 / 16) - int(hf_bb * 7.5 / 16) - int(head * 4.5 / 8)
     k = int(top_k or cfg_top_k)
     if available_bytes is None:
         available_bytes, source = available_memory_bytes(backend)

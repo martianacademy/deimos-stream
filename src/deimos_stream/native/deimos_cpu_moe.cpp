@@ -91,25 +91,15 @@ using deimos_simd::quantize_halfgroups_q8;
 struct CpuMoeTask {
     const uint8_t* const* leaf_ptrs = nullptr;
     const float*          scores    = nullptr;
-    int                   M         = 0;
-    int                   D         = 0;
-    int                   I         = 0;
-    int                   G         = 64;
-    const float*          xe        = nullptr;
-    const float*          xo        = nullptr;
-    const int8_t*         q8_xe     = nullptr;
-    const int8_t*         q8_xo     = nullptr;
-    const float*          sxe       = nullptr;
-    const float*          sxo       = nullptr;
-    const float*          sum_x     = nullptr;
-    float*                act_even  = nullptr;
-    float*                act_odd   = nullptr;
-    int8_t*               q8_ae     = nullptr;
-    int8_t*               q8_ao     = nullptr;
-    float*                sae       = nullptr;
-    float*                sao       = nullptr;
-    float*                act_sum   = nullptr;
-    uint16_t*             out_f16   = nullptr;
+    int M = 0, D = 0, I = 0, G = 64;
+    float swiglu_limit = 0.0f, swiglu_alpha = 1.0f, swiglu_up_offset = 0.0f;
+    const float *xe = nullptr, *xo = nullptr;
+    const int8_t *q8_xe = nullptr, *q8_xo = nullptr;
+    const float *sxe = nullptr, *sxo = nullptr, *sum_x = nullptr;
+    float *act_even = nullptr, *act_odd = nullptr;
+    int8_t *q8_ae = nullptr, *q8_ao = nullptr;
+    float *sae = nullptr, *sao = nullptr, *act_sum = nullptr;
+    uint16_t* out_f16 = nullptr;
 };
 
 class DeimosCpuMoePool {
@@ -213,7 +203,8 @@ private:
             deimos_simd::phase1_avx2_q8_range(
                 t.leaf_ptrs, t.I, half_d, ng_gu, hg,
                 t.q8_xe, t.q8_xo, t.sxe, t.sxo, t.sum_x,
-                t.act_even, t.act_odd, p0, p1
+                t.act_even, t.act_odd, p0, p1,
+                t.swiglu_limit, t.swiglu_alpha, t.swiglu_up_offset
             );
             return;
         }
@@ -243,7 +234,9 @@ private:
                     gu_b + static_cast<size_t>(r_up) * ng_gu,
                     t.xe, t.xo, t.sum_x, ng_gu, hg
                 );
-                float val = (gate / (1.0f + std::exp(-gate))) * up;
+                float val = deimos_simd::eval_swiglu_f32(
+                    gate, up, t.swiglu_limit, t.swiglu_alpha, t.swiglu_up_offset
+                );
                 if (sub == 0) t.act_even[m * half_i + j] = val;
                 else          t.act_odd[m * half_i + j]  = val;
             }
@@ -353,7 +346,10 @@ extern "C" int deimos_cpu_q4_swiglu_forward(
     int             hidden_size,
     int             intermediate_size,
     int             group_size,
-    int             verify_on_cold
+    int             verify_on_cold,
+    float           swiglu_limit,
+    float           swiglu_alpha,
+    float           swiglu_up_offset
 ) {
     if (!merkle_handle || !expert_ids || !expert_scores || !x_f16 || !out_f16 ||
         num_experts_active <= 0 || hidden_size <= 0 || intermediate_size <= 0 ||
@@ -414,6 +410,7 @@ extern "C" int deimos_cpu_q4_swiglu_forward(
     CpuMoeTask task{
         leaf_ptrs, expert_scores, num_experts_active,
         hidden_size, intermediate_size, group_size,
+        swiglu_limit, swiglu_alpha, swiglu_up_offset,
         xe, xo, q8_xe, q8_xo, sxe, sxo, sum_x,
         act_even, act_odd, q8_ae, q8_ao, sae, sao, act_sum, out_f16
     };
@@ -437,7 +434,8 @@ extern "C" void deimos_warm_cpu_moe_pool(
     float esc = 1.0f;
     deimos_cpu_q4_swiglu_forward(
         merkle_handle, 0, &eid, &esc, 1,
-        x_zero.data(), y_zero.data(), hidden_size, intermediate_size, group_size, 0
+        x_zero.data(), y_zero.data(), hidden_size, intermediate_size, group_size, 0,
+        0.0f, 1.0f, 0.0f
     );
     if (start_expert > 0) {
         deimos_evict_expert(merkle_handle, 0, 0);

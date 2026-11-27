@@ -99,13 +99,13 @@ def _get_cuda_lib(device: "torch.device") -> Optional[ctypes.CDLL]:
             _LIB_CACHE[arch] = None
             return None
         lib = ctypes.CDLL(str(so_path))
-        vp, ci = ctypes.c_void_p, ctypes.c_int
+        vp, ci, cf = ctypes.c_void_p, ctypes.c_int, ctypes.c_float
         lib.deimos_cuda_int8_gemv.argtypes = [vp] * 6 + [ci, ci, ci, vp]
         lib.deimos_cuda_int8_gemv.restype = ci
         lib.deimos_cuda_q4_dense_gemv.argtypes = [vp] * 10 + [ci, ci, ci, vp]
         lib.deimos_cuda_q4_dense_gemv.restype = ci
         lib.deimos_cuda_paged_q4_swiglu.argtypes = (
-            [vp] * 8 + [ci, vp, ci] + [vp] * 12 + [ci, ci, ci, ci, vp]
+            [vp] * 8 + [ci, vp, ci] + [vp] * 12 + [ci, ci, ci, ci, cf, cf, cf, vp]
         )
         lib.deimos_cuda_paged_q4_swiglu.restype = ci
         _LIB_CACHE[arch] = lib
@@ -211,6 +211,9 @@ def cuda_paged_q4_swiglu(
     flat_slots: "torch.Tensor",
     scores: "torch.Tensor",
     group_size: int = 64,
+    swiglu_limit: float = 0.0,
+    swiglu_alpha: float = 1.0,
+    swiglu_up_offset: float = 0.0,
 ) -> Optional["torch.Tensor"]:
     """Runs `sm_61+` `__dp4a` paged Q4 SwiGLU MoE skipping `score == 0.0` slots immediately."""
     N, D = int(x_chunk.shape[0]), int(x_chunk.shape[1])
@@ -253,6 +256,8 @@ def cuda_paged_q4_swiglu(
         sc.x_q8e.data_ptr(), sc.x_q8o.data_ptr(), sc.x_sxe.data_ptr(), sc.x_sxo.data_ptr(), sc.x_sum.data_ptr(),
         sc.act_f16.data_ptr(),
         sc.a_q8e.data_ptr(), sc.a_q8o.data_ptr(), sc.a_sxe.data_ptr(), sc.a_sxo.data_ptr(), sc.a_sum.data_ptr(),
-        N, D, inter, K, stream_ptr,
+        N, D, inter, K,
+        float(swiglu_limit), float(swiglu_alpha), float(swiglu_up_offset),
+        stream_ptr,
     )
     return out if rc == 0 else None

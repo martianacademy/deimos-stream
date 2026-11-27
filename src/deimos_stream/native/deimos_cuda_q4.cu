@@ -256,22 +256,13 @@ __global__ void q4_dense_gemv_dp4a_kernel(
 }
 
 __global__ void q4_gather_swiglu_dp4a_kernel(
-    const int8_t* __restrict__ q8e,
-    const int8_t* __restrict__ q8o,
-    const float* __restrict__ sxe,
-    const float* __restrict__ sxo,
-    const float* __restrict__ sumx,
-    const uint8_t* __restrict__ gu_w,
-    const __half* __restrict__ gu_s,
-    const __half* __restrict__ gu_b,
-    const void* __restrict__ slots_ptr,
-    int slots_is_i64,
-    const void* __restrict__ scores_ptr,
-    int scores_is_f32,
-    float* __restrict__ act_out,
-    int D,
-    int I,
-    int top_k
+    const int8_t* __restrict__ q8e, const int8_t* __restrict__ q8o,
+    const float* __restrict__ sxe, const float* __restrict__ sxo, const float* __restrict__ sumx,
+    const uint8_t* __restrict__ gu_w, const __half* __restrict__ gu_s, const __half* __restrict__ gu_b,
+    const void* __restrict__ slots_ptr, int slots_is_i64,
+    const void* __restrict__ scores_ptr, int scores_is_f32,
+    float* __restrict__ act_out, int D, int I, int top_k,
+    float swiglu_limit, float swiglu_alpha, float swiglu_up_offset
 ) {
     const int b = blockIdx.y;
     if (scores_ptr && read_score(scores_ptr, b, scores_is_f32) == 0.0f) return;
@@ -303,8 +294,12 @@ __global__ void q4_gather_swiglu_dp4a_kernel(
     float acc_g = warp_sum(q4_row_dot_lane(wg_row, sg_row, bg_row, x_qe, x_qo, x_se, x_so, x_sm, half_d, lane));
     float acc_u = warp_sum(q4_row_dot_lane(wu_row, su_row, bu_row, x_qe, x_qo, x_se, x_so, x_sm, half_d, lane));
     if (lane == 0) {
-        const float silu_g = acc_g / (1.0f + expf(-acc_g));
-        act_out[static_cast<size_t>(b) * I + row] = silu_g * acc_u;
+        if (swiglu_limit > 0.0f) {
+            acc_g = fminf(acc_g, swiglu_limit);
+            acc_u = fminf(fmaxf(acc_u, -swiglu_limit), swiglu_limit);
+        }
+        const float glu = acc_g / (1.0f + expf(-swiglu_alpha * acc_g));
+        act_out[static_cast<size_t>(b) * I + row] = glu * (acc_u + swiglu_up_offset);
     }
 }
 
@@ -432,33 +427,13 @@ int deimos_cuda_q4_dense_gemv(
 }
 
 int deimos_cuda_paged_q4_swiglu(
-    const void* x_f16,
-    const void* gu_w,
-    const void* gu_s,
-    const void* gu_b,
-    const void* dn_w,
-    const void* dn_s,
-    const void* dn_b,
-    const void* slots_ptr,
-    int slots_is_i64,
-    const void* scores_ptr,
-    int scores_is_f32,
-    void* out_f16,
-    void* x_q8e,
-    void* x_q8o,
-    void* x_sxe,
-    void* x_sxo,
-    void* x_sum,
-    void* act_f16,
-    void* a_q8e,
-    void* a_q8o,
-    void* a_sxe,
-    void* a_sxo,
-    void* a_sum,
-    int N,
-    int D,
-    int I,
-    int top_k,
+    const void* x_f16, const void* gu_w, const void* gu_s, const void* gu_b,
+    const void* dn_w, const void* dn_s, const void* dn_b,
+    const void* slots_ptr, int slots_is_i64, const void* scores_ptr, int scores_is_f32,
+    void* out_f16, void* x_q8e, void* x_q8o, void* x_sxe, void* x_sxo, void* x_sum,
+    void* act_f16, void* a_q8e, void* a_q8o, void* a_sxe, void* a_sxo, void* a_sum,
+    int N, int D, int I, int top_k,
+    float swiglu_limit, float swiglu_alpha, float swiglu_up_offset,
     void* stream_ptr
 ) {
     if (N <= 0 || top_k <= 0 || (D & 63) != 0 || (I & 63) != 0) return -1;
@@ -475,7 +450,8 @@ int deimos_cuda_paged_q4_swiglu(
         static_cast<const float*>(x_sxe), static_cast<const float*>(x_sxo), static_cast<const float*>(x_sum),
         static_cast<const uint8_t*>(gu_w), static_cast<const __half*>(gu_s), static_cast<const __half*>(gu_b),
         slots_ptr, slots_is_i64, scores_ptr, scores_is_f32,
-        static_cast<float*>(act_f16), D, I, top_k
+        static_cast<float*>(act_f16), D, I, top_k,
+        swiglu_limit, swiglu_alpha, swiglu_up_offset
     );
     quant_q8_split_g64_kernel<<<dim3(I >> 6, B), 32, 0, stream>>>(
         static_cast<const float*>(act_f16), scores_ptr, scores_is_f32,

@@ -7,9 +7,12 @@
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-brightgreen.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/martianacademy/deimos-stream/blob/main/LICENSE)
 
-**DeimosStream (`v0.7.0`)** is a universal low-VRAM **Sparse Mixture-of-Experts (MoE) LLM streaming engine** — the language-model twin to [**PhobosStream**](https://github.com/martianacademy/phobos-stream) — built to run massive 2025–2026 Sparse & Hybrid MoE models (**`Qwen3.6 / 3.5 / Next`**, **`Qwen2/3-MoE`**, **`DeepSeek-V2 / V3 / R1 / V3.2`**, **`Kimi-K2 / Moonlight`**, **`GLM-4.5`**, **`Llama-4 Scout & Maverick`**, **`OLMoE`**, **`Mixtral`**, **`MiniMax-M2`**, **`ERNIE-4.5`**, **`Jamba`**) faster than **`llama.cpp` (`--n-cpu-moe`)** and **`mlx-lm`** inside strictly bounded GPU & Host memory, with **zero quality loss (`--tau 1.0` exact routing)** and optional **cryptographic SHA-256 Merkle proof verification (`DEIMIDX2`)** on every cold expert page.
+**DeimosStream (`v0.8.0`)** is a universal low-VRAM **Sparse Mixture-of-Experts (MoE) LLM streaming engine** — the language-model twin to [**PhobosStream**](https://github.com/martianacademy/phobos-stream) — built to run **2026 Frontier Sparse & Hybrid MoE models** (**`Qwen3.6 / Qwen3.8 Hybrid`**, **`DeepSeek-V4-Flash / V3.2 / R1`**, **`GLM-5.3-Flash / GLM-4.7-Flash`**, **`MiniMax-M3.1-Flash`**, **`Kimi-K3 / K2.5 / Kimi-Linear`**, **`LiquidAI LFM2.5-MoE`**, **`Ling-3.2`**, **`Llama-4`**) faster than **`llama.cpp` (`--n-cpu-moe`)** and **`mlx-lm`** inside strictly bounded GPU & Host memory, with **zero quality loss (`--tau 1.0` exact routing)** and optional **cryptographic SHA-256 Merkle proof verification (`DEIMIDX2`)** on every cold expert page.
 
 By combining **Native `nvcc` `sm_61+` `__dp4a` CUDA Q4/INT8 Kernels** (`238 GB/s` INT8 GEMV • `222 GB/s` Q4 dense GEMV • `137 GB/s` gathered paged Q4 SwiGLU on Tesla T4), **81-Segment Static CUDA Graphs** with zero-spill Triton `GatedDeltaNet` recurrent state updates, a **Zero-PCIe C++17 `Q8_1 × Q4` `AVX2/NEON` Hybrid Miss Engine** with disjoint `< 24 GiB` `madvise(MADV_DONTNEED)` Host page-cache management, and **Compiled Apple Silicon `MLX` Metal Decode (`@mx.compile` + `mx.async_eval`)**, DeimosStream achieves at **exact `tau=1.0` routing**:
+* **306B `zai-org/GLM-5.3-Flash` (`305.78 GiB` FP8, `12,096` experts) on a single 15 GB T4 & 24 GB A10 GPU:**
+  * **Single `24 GB A10`:** **`3.44 tok/s`** (`--backbone q4 --slots auto`, **`23.0s` TTFT**, `164.8 GiB` RSS) and **`3.31 tok/s`** with a **full 16-bit `FP16` non-expert backbone** (`20.0 GiB` VRAM) — beating `llama.cpp UD-Q4_K_XL --n-cpu-moe 45` (`2.92 tok/s`, `81.7s` TTFT, `187.7 GiB` RSS; `--n-cpu-moe 42` OOMs).
+  * **Out-of-Core `112 GiB` Hard-Capped Host RAM (`< 61%` of `186 GiB` Q4 Model!) & Single `15 GB T4`:** **`2.14 tok/s`** (`46.2s` TTFT, `112.9 GiB` RSS) vs `llama.cpp` `1.02 tok/s` (`2.10×` faster decode, `3.17×` faster TTFT, `-74.8 GiB` RSS), plus **`10.96 GiB` PyTorch VRAM** execution on a single `15 GB Tesla T4`.
 * **35B `Qwen/Qwen3.6-35B-A3B` (`66.97 GiB` BF16, `10,240` experts) on a single 15 GB NVIDIA Tesla T4:**
   * **`32 GiB` Host RAM:** **`43.28 tok/s`** (`--slots auto` / `47.20 tok/s` steady-state), **`39.78 tok/s`** (`10.6 GiB` VRAM), **`38.84 tok/s`** (`6.4 GiB` VRAM), and **`29.89 tok/s`** (`2.7 GiB` VRAM) — **cleanly beating `llama.cpp Q4_K_M --n-cpu-moe 20/30/40`** (`35.15 / 28.94 / 28.15 tok/s`) across every VRAM tier.
   * **`12 GiB` Hard-Capped Host RAM:** **`29.08 / 14.47 / 11.22 tok/s`** (`13.2 GiB` RSS) vs **`llama.cpp --n-cpu-moe 20/30/40`** (`24.14 / 11.58 / 5.29 tok/s`, `20.8 GiB` RSS) — **`+20.5%` to `+112%` (`2.12×`) faster** with faster high-slot TTFT (`3.80s` vs `5.02s`).
@@ -77,7 +80,7 @@ By combining **Native `nvcc` `sm_61+` `__dp4a` CUDA Q4/INT8 Kernels** (`238 GB/s
 
 ---
 
-## 🏛️ System Architecture (`v0.7.0`)
+## 🏛️ System Architecture (`v0.8.0`)
 
 ```mermaid
 flowchart TD
@@ -119,21 +122,21 @@ flowchart TD
 
 ---
 
-## 🧩 Universal MoE Model Support (`v0.7.0`)
+## 🧩 2026 Frontier MoE Model Support
 
-DeimosStream includes a **trait-based Universal MoE Adapter system** (`model_adapters.py` + `mlx_universal.py`) that automatically discovers mixed dense + MoE layer schedules (`first_k_dense_replace`, `moe_layers`, `mlp_only_layers`), dequantizes block-scaled **`FP8 E4M3` (`weight_scale_inv`)** shards (`DeepSeek-V3 / R1`, `Kimi-K2`, `Qwen3-FP8`), normalizes transposed 3D **`Llama-4`** experts (`[E, D, 2I]` → `O(top_k)` sparse paging), and executes natively on both **NVIDIA CUDA** and **Apple Silicon `MLX` (`SwitchGLU`)**.
+DeimosStream's **trait-based Universal MoE Adapter** (`model_adapters.py` + `mlx_universal.py`) natively supports **late-2026 frontier MoE primitives**: clamped & alpha-scaled SwiGLU (`swiglu_limit=10.0` on `DeepSeek-V4` / `GLM-5.3-Flash`; `SwiGLU-OAI` `alpha=1.702, limit=7.0, up+1` on `MiniMax-M3.1-Flash`), `UE8M0` (`.scale`) and `FP8 E4M3` (`.weight_scale_inv`) block dequantization, `transformers` 5.x `conversion_mapping` + VLM text extraction, and mixed dense + MoE schedules across **NVIDIA CUDA** and **Apple Silicon `MLX`**.
 
-👉 **Full compatibility matrix, hardware sizing guide (`7B` → `1T`), and roadmap (`DeepSeek-V4.1-Flash` Engram / `gpt-oss` MXFP4):** [**`docs/MODEL_SUPPORT.md`**](https://github.com/martianacademy/deimos-stream/blob/main/docs/MODEL_SUPPORT.md)
+👉 **Full 2026 compatibility matrix, hardware sizing guide (`8B` → `1T`), and roadmap:** [**`docs/MODEL_SUPPORT.md`**](https://github.com/martianacademy/deimos-stream/blob/main/docs/MODEL_SUPPORT.md)
 
-| Family | `model_type` | Key Architectural Traits Handled Automatically | Representative Models |
+| 2026 Frontier Family | `model_type` | Key 2026 Traits Handled Automatically | Representative 2026 Checkpoints |
 | :--- | :--- | :--- | :--- |
-| **Qwen3.6 / 3.5 / Next** | `qwen3_5_moe`, `qwen3_next` | Hybrid `GatedDeltaNet` + QK-Norm GQA, gated shared expert, 81-segment CUDA Graphs | `Qwen/Qwen3.6-35B-A3B`, `Qwen/Qwen3-Next-80B-A3B` |
-| **DeepSeek-V3 / R1 / Kimi-K2** | `deepseek_v3`, `deepseek_v32` | **MLA + YaRN**, `first_k_dense_replace=1..3`, `NoAux` sigmoid router, `[128,128]` `FP8` shards | `DeepSeek-V3` (`671B`), `DeepSeek-R1`, `Moonlight-16B-A3B`, `Kimi-K2` |
-| **DeepSeek-V2 / V2-Lite** | `deepseek_v2` | **MLA**, dense layer 0 + routed MoE layers `1..L-1`, additive `shared_experts` | `DeepSeek-V2-Lite-Chat` (`16B`), `DeepSeek-V2.5` |
-| **GLM-4.5 / 4.7 MoE** | `glm4_moe`, `glm4_moe_lite` | Partial-RoPE GQA / MLA, `first_k_dense_replace=1`, `NoAux` sigmoid, MTP layer stripping | `zai-org/GLM-4.5-Air` (`106B`), `zai-org/GLM-4.5` |
-| **Llama 4 (Scout & Maverick)** | `llama4`, `llama4_text` | Interleaved `moe_layers`, `[E, D, 2I]` transpose, `O(top_k)` sparse router + `ChunkedKVCache` | `Llama-4-Scout-17B-16E` (`109B`), `Llama-4-Maverick-17B-128E` (`400B`) |
-| **Qwen2/3-MoE, OLMoE, Mixtral** | `qwen3_moe`, `olmoe`, `mixtral`, `phimoe` | GQA / SWA, full or per-head QK-Norm, `mlp_only_layers`, native `shared_core` or HF/MLX | `Qwen3-30B-A3B`, `Qwen3-235B-A22B`, `OLMoE-1B-7B`, `Mixtral-8x7B` |
-| **MiniMax / ERNIE-4.5 / Jamba** | `minimax_m2`, `ernie4_5_moe`, `jamba`, `granitemoehybrid` | Interleaved MoE discovery, `Mamba2`-SSM + GQA hybrids, router bias correction | `MiniMax-M2`, `ERNIE-4.5-21B-A3B`, `AI21-Jamba-1.5-Mini` |
+| **Qwen3.6 / Qwen3.8 Hybrid** | `qwen3_5_moe`, `qwen4_exp_text` | Hybrid `GatedDeltaNet` + `QSA` / QK-Norm GQA, gated shared expert, 81-segment CUDA Graphs | `Qwen/Qwen3.6-35B-A3B`, `Qwen/Qwen3.8-Flash-Next` |
+| **DeepSeek-V4 / V3.2 / R1** | `deepseek_v4`, `deepseek_v32`, `deepseek_v3` | **MLA + HCA/CSA + mHC**, `sqrtsoftplus` / `NoAux` router, `UE8M0` `.scale` & `FP8`, `swiglu_limit=10.0` | `deepseek-ai/DeepSeek-V4-Flash-0731`, `DeepSeek-V3.2`, `DeepSeek-R1` |
+| **GLM-5.3-Flash / 4.7-Flash** | `glm5_next`, `glm4_moe_lite` | Hybrid Linear Attn + **DSA/MLA + mHC**, multimodal VLM extraction, `FP8`, `swiglu_limit=10.0` | `zai-org/GLM-5.3-Flash`, `zai-org/GLM-5.2`, `zai-org/GLM-4.7-Flash` |
+| **Kimi-K3 / K2.5 / Linear** | `kimi_linear`, `kimi_k3`, `kimi_k25` | Hybrid **KimiDeltaAttention (`KDA`) + MLA**, `NoAux` sigmoid router, short-conv mapping | `moonshotai/Kimi-K3`, `moonshotai/Kimi-K2.5`, `Kimi-Linear-48B-A3B` |
+| **MiniMax-M3.1-Flash / M3** | `minimax_m3_vl` | Sliding/Full GQA + `GemmaRMSNorm`, **`SwiGLU-OAI` (`alpha=1.702, limit=7.0, up+1`)** | `MiniMaxAI/MiniMax-M3.1-Flash`, `MiniMaxAI/MiniMax-M3` |
+| **LiquidAI LFM2.5 & Ling-3.2** | `lfm2_moe`, `bailing_hybrid` | `LIV ShortConv` + GQA (`num_dense_layers`) & `KDA + MLA` (`512E` routed layers) | `LiquidAI/LFM2.5-24B-A2B`, `LFM2.5-8B-A1B`, `inclusionAI/Ling-3.2-air` |
+| **Llama 4 & Legacy MoEs** | `llama4`, `qwen3_moe`, `ernie4_5_moe`, `deepseek_v2` | Transposed `[E, D, 2I]` 3D experts, `O(top_k)` sparse router, full 2025 backward compatibility | `Llama-4-Scout-17B-16E`, `Qwen3-235B-A22B`, `ERNIE-4.5-21B-A3B` |
 
 Inspect all registered families and roadmap architectures from the CLI:
 ```bash
@@ -163,12 +166,12 @@ uv pip install -e ".[cuda,dev]"
 pytest -v
 ```
 
-### 2. Convert Any `.safetensors` or HuggingFace Sparse / Hybrid-MoE Checkpoint & Run
+### 2. Convert Any 2026 HuggingFace Sparse / Hybrid-MoE Checkpoint & Run
 
-Supports local `.safetensors` checkpoints **and direct shard-by-shard HuggingFace Hub streaming** across **`Qwen3.6 / 3.5 / Next`**, **`DeepSeek-V2 / V3 / R1 / V3.2` (`FP8` or `BF16`)**, **`Kimi-K2 / Moonlight`**, **`GLM-4.5`**, **`Llama-4 Scout & Maverick`**, **`Qwen2/3-MoE`**, **`OLMoE`**, **`Mixtral`**, **`MiniMax-M2`**, **`ERNIE-4.5`**, and **`Jamba`**:
+Supports local `.safetensors` checkpoints **and direct shard-by-shard HuggingFace Hub streaming** across **`Qwen3.6 / Qwen3.8`**, **`DeepSeek-V4-Flash / V3.2 / R1` (`UE8M0` / `FP8` / `BF16`)**, **`GLM-5.3-Flash / GLM-4.7-Flash`**, **`MiniMax-M3.1-Flash`**, **`Kimi-K3 / K2.5 / Kimi-Linear`**, **`LiquidAI LFM2.5-MoE`**, **`Ling-3.2`**, and **`Llama-4`**:
 
 ```bash
-# 0. Inspect all supported MoE model families & roadmap architectures:
+# 0. Inspect all supported 2026 MoE model families & roadmap architectures:
 deimos-stream models
 
 # 1a. Convert 35B Qwen/Qwen3.6-35B-A3B (66.97 GiB BF16 -> 20.99 GiB DEIMIDX2 Q4):
@@ -176,15 +179,15 @@ deimos-stream convert \
   --model-dir Qwen/Qwen3.6-35B-A3B \
   --output-dir ./qwen36_35b_deimos_q4
 
-# 1b. Convert MLA / mixed-dense-MoE / FP8 checkpoints (DeepSeek-V2-Lite, Moonlight-16B, GLM-4.5-Air, DeepSeek-V3):
+# 1b. Convert compact Oct-2026 LiquidAI LFM2.5-24B-A2B or GLM-4.7-Flash (30B-A3B):
 deimos-stream convert \
-  --model-dir moonshotai/Moonlight-16B-A3B-Instruct \
-  --output-dir ./moonlight_16b_deimos_q4
+  --model-dir LiquidAI/LFM2.5-24B-A2B \
+  --output-dir ./lfm25_24b_deimos_q4
 
-# 1c. Or convert any local .safetensors Sparse MoE (auto-detects native vs universal HF/MLX store):
+# 1c. Convert flagship 2026 UE8M0 / FP8 clamped-SwiGLU MoEs (DeepSeek-V4-Flash, GLM-5.3-Flash):
 deimos-stream convert \
-  --model-dir /path/to/OLMoE-1B-7B-0125-Instruct \
-  --output-dir ./olmoe_deimos_q4
+  --model-dir deepseek-ai/DeepSeek-V4-Flash-0731 \
+  --output-dir ./deepseek_v4_flash_deimos_q4
 
 # 2. Cryptographically verify the Tier-1 XOR Merkle tree & all Tier-2 SHA-256 expert leaves:
 deimos-stream inspect --store-dir ./qwen36_35b_deimos_q4 --verify-leaves
@@ -197,7 +200,7 @@ deimos-stream chat --store-dir ./qwen36_35b_deimos_q4 --backbone q4 --slots 64 -
 deimos-stream chat --store-dir ./qwen36_35b_deimos_q4 --backbone q4 --slots 8 --tau 1.0 --no-verify
 
 # 5. Benchmark throughput, TTFT, hit rate, and VRAM/RSS telemetry as JSON:
-deimos-stream bench --store-dir ./olmoe_deimos_q4 --backbone q4 --tau 1.0 --tokens 128
+deimos-stream bench --store-dir ./qwen36_35b_deimos_q4 --backbone q4 --tau 1.0 --tokens 128
 ```
 
 Inside interactive `deimos-stream chat`, switch VRAM budgets and routing thresholds live:

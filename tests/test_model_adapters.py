@@ -284,10 +284,16 @@ def test_roadmap_validation_and_models_cli(capsys: pytest.CaptureFixture[str]) -
         )
     with pytest.raises(ValueError, match="gpt_oss"):
         validate_convertible_architecture({"model_type": "gpt_oss"})
+    with pytest.raises(ValueError, match="inkling2_loop"):
+        validate_convertible_architecture({"model_type": "inkling2_loop"})
 
     rc = cli_main(["models"])
     assert rc == 0
     out = json.loads(capsys.readouterr().out)
     assert len(out["supported"]) >= 8
-    assert any("DeepSeek-V3" in f["family"] for f in out["supported"])
+    assert any("DeepSeek-V4" in f["family"] for f in out["supported"])
+    assert any("GLM-5.3-Flash" in f["family"] for f in out["supported"])
+    assert any("Qwen3.8" in f["family"] for f in out["supported"])
+    assert any("Kimi-K3" in f["family"] for f in out["supported"])
+    assert any("MiniMax-M3.1" in f["family"] for f in out["supported"])
     assert any("DeepSeek-V4.1-Flash" in r["family"] for r in out["roadmap"])

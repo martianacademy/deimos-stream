@@ -64,6 +64,7 @@ def bind_hybrid_c_api(lib: ctypes.CDLL) -> None:
     lib.deimos_cpu_q4_swiglu_forward.argtypes = [
         ctypes.c_void_p, ctypes.c_int, i32p, f32p, ctypes.c_int,
         u16p, u16p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ctypes.c_float, ctypes.c_float, ctypes.c_float,
     ]
     lib.deimos_cpu_q4_swiglu_forward.restype = ctypes.c_int
     lib.deimos_warm_cpu_moe_pool.argtypes = [
@@ -96,6 +97,12 @@ def execute_torch_moe_layer(
     K = int(top_k_index.shape[-1])
     l_i = int(layer_idx)
 
+    sw_kw = {
+        "group_size": arena.group_size,
+        "swiglu_limit": arena.swiglu_limit,
+        "swiglu_alpha": arena.swiglu_alpha,
+        "swiglu_up_offset": arena.swiglu_up_offset,
+    }
     if arena.is_fully_pinned:
         y_sh = shared_fn() if shared_fn is not None else None
         y = run_paged_q4_swiglu(
@@ -104,7 +111,7 @@ def execute_torch_moe_layer(
             arena.dn_w[l_i], arena.dn_s[l_i], arena.dn_b[l_i],
             top_k_index.reshape(-1).to(torch.long),
             top_k_weights,
-            group_size=arena.group_size,
+            **sw_kw,
         )
         return (y + y_sh) if y_sh is not None else y
 
@@ -137,7 +144,7 @@ def execute_torch_moe_layer(
                 arena.dn_w[l_i], arena.dn_s[l_i], arena.dn_b[l_i],
                 torch.from_numpy(phys_np.reshape(-1)).long(),
                 sc_t,
-                group_size=arena.group_size,
+                **sw_kw,
             ))
         y = outs[0] if len(outs) == 1 else torch.cat(outs, dim=0)
         return (y + y_sh) if y_sh is not None else y
@@ -220,7 +227,7 @@ def execute_torch_moe_layer(
                 x_chunk,
                 arena.gu_w[l_i], arena.gu_s[l_i], arena.gu_b[l_i],
                 arena.dn_w[l_i], arena.dn_s[l_i], arena.dn_b[l_i],
-                s_gpu, w_use, group_size=arena.group_size,
+                s_gpu, w_use, **sw_kw,
             )
 
         if nm > 0:
@@ -233,6 +240,7 @@ def execute_torch_moe_layer(
                 ctypes.cast(arena._pin_cpu_out.data_ptr(), ctypes.POINTER(ctypes.c_uint16)),
                 D, arena.intermediate_size, arena.group_size,
                 1 if arena.verify_merkle_on_cold else 0,
+                float(arena.swiglu_limit), float(arena.swiglu_alpha), float(arena.swiglu_up_offset),
             )
             if rc_cpu == -2:
                 raise DeimosMerkleIntegrityError(f"Corrupted Q4 Merkle leaf rejected in layer {l_i}!")
@@ -267,7 +275,7 @@ def execute_torch_moe_layer(
             arena.dn_w[l_i], arena.dn_s[l_i], arena.dn_b[l_i],
             torch.from_numpy(phys_np.reshape(-1)).to(device=arena.device, dtype=torch.long),
             top_k_weights[s0:s1],
-            group_size=arena.group_size,
+            **sw_kw,
         ))
     y_b = outs_b[0] if len(outs_b) == 1 else torch.cat(outs_b, dim=0)
     return (y_b + y_sh) if y_sh is not None else y_b

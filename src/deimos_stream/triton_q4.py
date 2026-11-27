@@ -48,7 +48,9 @@ if HAS_TRITON:
     def _q4_gather_swiglu_kernel(
         x_ptr, w32_ptr, s_ptr, b_ptr, slots_ptr, out_ptr,
         inter_dim, num_steps, top_k,
+        swiglu_limit, swiglu_alpha, swiglu_up_offset,
         stride_xn, stride_ws, stride_wr, stride_ss, stride_sr, stride_ob,
+        HAS_CUSTOM_ACT: tl.constexpr,
         WORDS_G: tl.constexpr, WORDS_STEP: tl.constexpr, BLOCK_M: tl.constexpr,
     ):
         pid_b = tl.program_id(0)
@@ -118,7 +120,13 @@ if HAS_TRITON:
             bu = tl.load(b_ptr + sbu_base[:, None] + grp_off, mask=row_mask[:, None], other=0.0).to(tl.float32)
             acc_u += tl.sum(du * su + x_wsum[None, :] * bu, axis=1)
 
-        act = (acc_g * tl.sigmoid(acc_g)) * acc_u
+        if HAS_CUSTOM_ACT:
+            if swiglu_limit > 0.0:
+                acc_g = tl.minimum(acc_g, swiglu_limit)
+                acc_u = tl.minimum(tl.maximum(acc_u, -swiglu_limit), swiglu_limit)
+            act = (acc_g * tl.sigmoid(swiglu_alpha * acc_g)) * (acc_u + swiglu_up_offset)
+        else:
+            act = (acc_g * tl.sigmoid(acc_g)) * acc_u
         tl.store(out_ptr + pid_b.to(tl.int64) * stride_ob + rows, act.to(out_ptr.dtype.element_ty), mask=row_mask)
 
     @triton.jit
@@ -244,17 +252,25 @@ def run_paged_q4_swiglu(
     flat_slots: "torch.Tensor",
     scores: "torch.Tensor",
     group_size: int = 64,
+    swiglu_limit: float = 0.0,
+    swiglu_alpha: float = 1.0,
+    swiglu_up_offset: float = 0.0,
 ) -> "torch.Tensor":
     """Executes paged 4-bit SwiGLU MoE in 2 warp-coalesced `WORDS_STEP=32` Triton launches."""
     N, D = x_chunk.shape
     K = int(scores.shape[1])
     dt = x_chunk.dtype
+    lim = float(swiglu_limit)
+    alp = float(swiglu_alpha)
+    uoff = float(swiglu_up_offset)
+    custom_act = lim > 0.0 or alp != 1.0 or uoff != 0.0
 
     if N <= 16 and x_chunk.device.type == "cuda":
         fast = cuda_paged_q4_swiglu(
             x_chunk, gu_w_pool, gu_s_pool, gu_b_pool,
             dn_w_pool, dn_s_pool, dn_b_pool,
             flat_slots, scores, group_size=group_size,
+            swiglu_limit=lim, swiglu_alpha=alp, swiglu_up_offset=uoff,
         )
         if fast is not None:
             return fast
@@ -273,8 +289,10 @@ def run_paged_q4_swiglu(
         _q4_gather_swiglu_kernel[(B, triton.cdiv(inter, block_m))](
             x_c, gu_w32, gu_s_pool, gu_b_pool, slots_c, act,
             inter, int(words_d) // words_step, K,
+            lim, alp, uoff,
             int(x_c.stride(0)), int(gu_w32.stride(0)), int(gu_w32.stride(1)),
             int(gu_s_pool.stride(0)), int(gu_s_pool.stride(1)), int(act.stride(0)),
+            HAS_CUSTOM_ACT=custom_act,
             WORDS_G=words_g, WORDS_STEP=words_step, BLOCK_M=block_m, num_warps=4,
         )
         dn_weighted = triton_q4_gather_gemv(
@@ -290,7 +308,14 @@ def run_paged_q4_swiglu(
     )
     x_rep = x_chunk.unsqueeze(1).expand(N, K, D).reshape(N * K, D, 1)
     gate, up = torch.bmm(gu_w, x_rep).squeeze(-1).chunk(2, dim=-1)
-    act_cpu = (F.silu(gate) * up).unsqueeze(-1)
+    if custom_act:
+        gf, uf = gate.float(), up.float()
+        if lim > 0.0:
+            gf = gf.clamp(max=lim)
+            uf = uf.clamp(min=-lim, max=lim)
+        act_cpu = ((gf * torch.sigmoid(alp * gf)) * (uf + uoff)).to(dt).unsqueeze(-1)
+    else:
+        act_cpu = (F.silu(gate) * up).unsqueeze(-1)
     dn_w = unpack_q4_torch(
         dn_w_pool[flat_slots], dn_s_pool[flat_slots], dn_b_pool[flat_slots],
         group_size=group_size, out_dtype=dt,

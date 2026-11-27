@@ -19,14 +19,16 @@ and deletes downloaded shards via reference counting (`delete_downloaded_shards=
 from __future__ import annotations
 
 from collections import Counter
+from concurrent.futures import Future, ThreadPoolExecutor
 import gc
 import hashlib
 import json
 from pathlib import Path
 import shutil
 import sys
+import threading
 import time
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 import numpy as np
 from safetensors import safe_open
@@ -41,6 +43,7 @@ from deimos_stream.model_adapters import (
     detect_lm_prefix,
     discover_hf_moe_layers,
     extract_layer_experts_gu_dn,
+    is_companion_scale_key,
     is_ignored_checkpoint_key,
     pop_tensor_dequant,
     validate_convertible_architecture,
@@ -55,11 +58,22 @@ else:
 
 
 def quantize_torch_to_q4_bytes(
-    weight_t: "torch.Tensor", group_size: int = 64
+    weight_t: "torch.Tensor", group_size: int = 64, q_dev: str = "cpu", chunk_e: int = 32
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """GPU-accelerated 4-bit affine group-64 quantizer producing `(qw_u32, scales_f16, biases_f16)`."""
+    """Chunked GPU-accelerated 4-bit affine group-64 quantizer (`< 1.5 GiB` VRAM even on 300B+ MoEs)."""
+    if weight_t.ndim == 3 and weight_t.shape[0] > chunk_e:
+        qws, qss, qbs = [], [], []
+        for e0 in range(0, int(weight_t.shape[0]), chunk_e):
+            qw, qs, qb = quantize_torch_to_q4_bytes(
+                weight_t[e0 : e0 + chunk_e], group_size=group_size, q_dev=q_dev, chunk_e=chunk_e
+            )
+            qws.append(qw)
+            qss.append(qs)
+            qbs.append(qb)
+        return np.concatenate(qws, axis=0), np.concatenate(qss, axis=0), np.concatenate(qbs, axis=0)
+
     orig_shape = tuple(weight_t.shape)
-    w_f32 = weight_t.to(torch.float32)
+    w_f32 = weight_t.to(device=q_dev, dtype=torch.float32)
     grouped = w_f32.reshape(*orig_shape[:-1], orig_shape[-1] // group_size, group_size)
 
     w_min = grouped.amin(dim=-1)
@@ -103,32 +117,74 @@ class _RefCountedShardFetcher:
         self.delete_shards = bool(delete_shards and self.local_dir is None)
         self.refcounts: Counter[str] = Counter(weight_map[k] for k in needed_keys)
         self._shard_paths: Dict[str, Path] = {}
+        self._open_handles: Dict[Tuple[str, str], object] = {}
+        self._lock = threading.Lock()
+        self._futures: Dict[str, Future[Path]] = {}
+        self._pool: Optional[ThreadPoolExecutor] = (
+            ThreadPoolExecutor(max_workers=3) if self.local_dir is None else None
+        )
+
+    def _dl_shard(self, shard_name: str) -> Path:
+        from huggingface_hub import hf_hub_download
+
+        return Path(hf_hub_download(repo_id=self.repo_id, filename=shard_name, local_dir=str(self.cache_dir)))
+
+    def prefetch_prefixes(self, prefixes: Iterable[str], active_keys: Set[str]) -> None:
+        if self._pool is None:
+            return
+        pfxs = tuple(prefixes)
+        if not pfxs:
+            return
+        shards = sorted({self.weight_map[k] for k in active_keys if k.startswith(pfxs)})
+        with self._lock:
+            for sn in shards:
+                if self.refcounts[sn] > 0 and sn not in self._futures:
+                    self._futures[sn] = self._pool.submit(self._dl_shard, sn)
 
     def _ensure_shard(self, shard_name: str) -> Path:
         if self.local_dir is not None:
             return self.local_dir / shard_name
-        if shard_name not in self._shard_paths or not self._shard_paths[shard_name].exists():
-            from huggingface_hub import hf_hub_download
-
-            dl = hf_hub_download(
-                repo_id=self.repo_id, filename=shard_name, local_dir=str(self.cache_dir)
-            )
-            self._shard_paths[shard_name] = Path(dl)
-        return self._shard_paths[shard_name]
+        with self._lock:
+            if shard_name in self._shard_paths and self._shard_paths[shard_name].exists():
+                return self._shard_paths[shard_name]
+            fut = self._futures.get(shard_name)
+            if fut is None:
+                assert self._pool is not None
+                fut = self._pool.submit(self._dl_shard, shard_name)
+                self._futures[shard_name] = fut
+        dl_p = fut.result()
+        with self._lock:
+            self._shard_paths[shard_name] = dl_p
+        return dl_p
 
     def pop_tensor(self, key: str, device: str = "cpu") -> "torch.Tensor":
         shard_name = self.weight_map[key]
         spath = self._ensure_shard(shard_name)
-        with safe_open(str(spath), framework="pt", device=device) as sf:
-            t = sf.get_tensor(key)
+        hk = (shard_name, device)
+        sf = self._open_handles.get(hk)
+        if sf is None:
+            sf = safe_open(str(spath), framework="pt", device=device)
+            self._open_handles[hk] = sf
+        t = sf.get_tensor(key)  # type: ignore[attr-defined]
         self.refcounts[shard_name] -= 1
-        if self.delete_shards and self.refcounts[shard_name] <= 0:
-            try:
-                spath.unlink()
-            except OSError:
-                pass
-            self._shard_paths.pop(shard_name, None)
+        if self.refcounts[shard_name] <= 0:
+            for k_open in [k0 for k0 in self._open_handles if k0[0] == shard_name]:
+                self._open_handles.pop(k_open, None)
+            if self.delete_shards:
+                try:
+                    spath.unlink()
+                except OSError:
+                    pass
+                with self._lock:
+                    self._shard_paths.pop(shard_name, None)
+                    self._futures.pop(shard_name, None)
         return t
+
+    def close(self) -> None:
+        self._open_handles.clear()
+        if self._pool is not None:
+            self._pool.shutdown(wait=True)
+            self._pool = None
 
 
 def _fetch_metadata_files(
@@ -289,15 +345,18 @@ def convert_hf_hybrid_moe_to_deimos(
 
     with open(out_dir / "cas_experts_q4.bin", "wb") as cas_f:
         for l_idx in range(num_layers):
+            fetcher.prefetch_prefixes(
+                [f"{layers_pfx}.{j}." for j in (l_idx, l_idx + 1) if j < num_layers], active_keys
+            )
             lp = f"{layers_pfx}.{l_idx}"
             if l_idx in moe_map:
                 gu_t, dn_t = extract_layer_experts_gu_dn(
                     fetcher, lp, moe_map[l_idx], num_experts, hidden_size, inter_size,
                     active_keys, used_special, q_dev,
                 )
-                gu_qw, gu_qs, gu_qb = quantize_torch_to_q4_bytes(gu_t, group_size=group_size)
+                gu_qw, gu_qs, gu_qb = quantize_torch_to_q4_bytes(gu_t, group_size=group_size, q_dev=q_dev)
                 del gu_t
-                dn_qw, dn_qs, dn_qb = quantize_torch_to_q4_bytes(dn_t, group_size=group_size)
+                dn_qw, dn_qs, dn_qb = quantize_torch_to_q4_bytes(dn_t, group_size=group_size, q_dev=q_dev)
                 del dn_t
                 for e_idx in range(num_experts):
                     raw_leaf = (
@@ -310,7 +369,7 @@ def convert_hf_hybrid_moe_to_deimos(
 
             layer_pfx = f"{lp}."
             for k in sorted(active_keys):
-                if k.startswith(layer_pfx) and k not in used_special and not k.endswith("_scale_inv"):
+                if k.startswith(layer_pfx) and k not in used_special and not is_companion_scale_key(k, active_keys):
                     t_cpu = pop_tensor_dequant(fetcher, k, active_keys, used_special, device="cpu")
                     ck = canonicalize_hf_key(k, lp_root)
                     backbone_sd[ck] = _cast_backbone_tensor(ck, t_cpu)
@@ -321,12 +380,13 @@ def convert_hf_hybrid_moe_to_deimos(
             sys.stdout.flush()
 
     for k in sorted(active_keys - used_special):
-        if k.endswith("_scale_inv"):
+        if is_companion_scale_key(k, active_keys):
             continue
         t_cpu = pop_tensor_dequant(fetcher, k, active_keys, used_special, device="cpu")
         ck = canonicalize_hf_key(k, lp_root)
         backbone_sd[ck] = _cast_backbone_tensor(ck, t_cpu)
 
+    fetcher.close()
     bb_path = out_dir / "hf_backbone.safetensors"
     st_save_torch(backbone_sd, str(bb_path))
     backbone_sd.clear()
@@ -338,6 +398,8 @@ def convert_hf_hybrid_moe_to_deimos(
     t_cfg.pop("quantization_config", None)
     t_cfg.pop("quantization", None)
     t_cfg["num_experts"] = num_experts
+    if "num_experts_per_tok" not in t_cfg and "num_experts_per_token" in t_cfg:
+        t_cfg["num_experts_per_tok"] = int(t_cfg["num_experts_per_token"])
     if "moe_intermediate_size" not in t_cfg:
         t_cfg["intermediate_size"] = inter_size
     (out_dir / "config.json").write_text(json.dumps(t_cfg, indent=2))

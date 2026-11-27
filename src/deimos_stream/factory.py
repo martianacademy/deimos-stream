@@ -19,6 +19,8 @@ from typing import Optional, Union
 
 from deimos_stream.engine import HAS_MLX, DeimosPagedMoEEngine
 from deimos_stream.fast_decode import apply_q4_backbone, apply_q4_backbone_mlx_hybrid
+from deimos_stream.fp8_engine import DeimosFP8SafetensorsEngine
+from deimos_stream.fp8_safetensors import is_raw_fp8_moe_checkpoint
 from deimos_stream.hf_streamer import DeimosHFHybridMoEEngine
 from deimos_stream.memory_budget import SlotPlan, SlotsArg, parse_slots_arg, plan_slots
 from deimos_stream.mlx_hybrid import DeimosMLXHybridMoEEngine
@@ -37,6 +39,7 @@ AnyDeimosEngine = Union[
     DeimosMLXUniversalMoEEngine,
     TorchDeimosPagedMoEEngine,
     DeimosHFHybridMoEEngine,
+    DeimosFP8SafetensorsEngine,
 ]
 
 
@@ -118,12 +121,15 @@ def create_paged_moe_engine(
     )
 
     mf_path = sdir / "merkle_manifest.json"
+    is_raw_fp8 = not mf_path.exists() and is_raw_fp8_moe_checkpoint(sdir)
     is_hybrid = (sdir / "hf_backbone.safetensors").exists()
     if mf_path.exists() and not is_hybrid:
         is_hybrid = json.loads(mf_path.read_text()).get("store_kind") == "hf_hybrid_q4"
 
     eng: AnyDeimosEngine
-    if is_hybrid:
+    if is_raw_fp8:
+        eng = DeimosFP8SafetensorsEngine(device_str=resolved, backbone=backbone, **common)  # type: ignore[arg-type]
+    elif is_hybrid:
         if resolved == "mlx":
             mtype = ""
             cfg_p = sdir / "config.json"
@@ -133,6 +139,8 @@ def create_paged_moe_engine(
                 eng = DeimosMLXHybridMoEEngine(backbone=backbone, **common)  # type: ignore[arg-type]
                 if backbone == "q4":
                     apply_q4_backbone_mlx_hybrid(eng)
+            elif backend == "auto" and mtype in {"deepseek_v4", "glm5_next", "glm5_next_text", "qwen4_exp", "qwen4_exp_text"}:
+                eng = DeimosHFHybridMoEEngine(device_str="cpu", backbone=backbone, **common)  # type: ignore[arg-type]
             else:
                 eng = DeimosMLXUniversalMoEEngine(backbone=backbone, **common)  # type: ignore[arg-type]
         else:

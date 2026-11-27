@@ -269,9 +269,15 @@ class DeimosChatSession:
 
 
 def inspect_store(store_dir: Path, verify_all_leaves: bool = False) -> Dict[str, object]:
-    """Verifies `DEIMIDX2` Tier-1 Merkle tree (and optionally all cold SHA-256 leaves)."""
+    """Verifies `DEIMIDX2` Tier-1 Merkle tree or inspects a zero-copy raw `.safetensors` FP8 checkpoint."""
     sdir = Path(store_dir).expanduser().resolve()
     t0 = time.perf_counter()
+    if not (sdir / "merkle_manifest.json").exists():
+        from deimos_stream.fp8_engine import inspect_raw_fp8_store
+        from deimos_stream.fp8_safetensors import is_raw_fp8_moe_checkpoint
+
+        if is_raw_fp8_moe_checkpoint(sdir):
+            return inspect_raw_fp8_store(sdir)
     bridge = DeimosMerkleBridge(sdir, enable_nocache_fd=False)
     try:
         h = bridge.header

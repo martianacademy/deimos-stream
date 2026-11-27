@@ -122,6 +122,9 @@ class TorchPagedExpertArena:
         self._layer_promo_ev: List[Optional[torch.cuda.Event]] = [None] * self.num_layers
         self._evict_host_on_stage: bool = False
         self._deferred_warm_range: Optional[Tuple[int, int]] = None
+        self.swiglu_limit: float = 0.0
+        self.swiglu_alpha: float = 1.0
+        self.swiglu_up_offset: float = 0.0
 
         if self.is_cuda:
             if torch.get_num_threads() > 2:

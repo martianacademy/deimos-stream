@@ -58,11 +58,18 @@ except ImportError:
 class DeimosMLXSwitchGLU(_NNModule):  # type: ignore[misc,valid-type]
     """Drop-in `PagedExpertArena` (`mx.gather_qmm`) replacement for `mlx_lm` `SwitchGLU`."""
 
-    def __init__(self, arena_idx: int, arena: PagedExpertArena, engine_ref: "DeimosMLXUniversalMoEEngine"):
+    def __init__(
+        self,
+        arena_idx: int,
+        arena: PagedExpertArena,
+        engine_ref: "DeimosMLXUniversalMoEEngine",
+        custom_act: Any = None,
+    ):
         super().__init__()
         self.arena_idx = int(arena_idx)
         self.arena = arena
         self.engine_ref = engine_ref
+        self.custom_act = custom_act
 
     def __call__(self, x: "mx.array", indices: "mx.array") -> "mx.array":
         orig_prefix = x.shape[:-1]
@@ -91,7 +98,10 @@ class DeimosMLXSwitchGLU(_NNModule):  # type: ignore[misc,valid-type]
                 self.arena.gu_w[a_i], self.arena.gu_s[a_i], self.arena.gu_b[a_i],
                 rhs_indices=phys, transpose=True, group_size=self.arena.group_size, bits=4,
             )
-            act = nn.silu(gu[..., :inter]) * gu[..., inter:]
+            if self.custom_act is not None:
+                act = self.custom_act(gu[..., inter:], gu[..., :inter]).astype(mx.float16)
+            else:
+                act = nn.silu(gu[..., :inter]) * gu[..., inter:]
             dn = mx.gather_qmm(
                 act,
                 self.arena.dn_w[a_i], self.arena.dn_s[a_i], self.arena.dn_b[a_i],
@@ -109,7 +119,10 @@ def _replace_layer_switch_glu(
     """Recursively replaces the routed `SwitchGLU` child inside a single decoder layer."""
     for attr_k, child in list(module.children().items()):
         if isinstance(child, SwitchGLU):
-            module[attr_k] = DeimosMLXSwitchGLU(arena_idx, arena, eng)
+            c_act = getattr(child, "activation", None)
+            if c_act is not None and type(c_act).__name__ == "SwiGLU":
+                c_act = None
+            module[attr_k] = DeimosMLXSwitchGLU(arena_idx, arena, eng, custom_act=c_act)
             return True
         if isinstance(child, nn.Module) and _replace_layer_switch_glu(child, arena_idx, arena, eng):
             return True
@@ -148,7 +161,7 @@ class DeimosMLXUniversalMoEEngine:
         self.num_experts = int(self.config["num_experts"])
         self.hidden_size = int(self.config["hidden_size"])
         self.vocab_size = int(self.config["vocab_size"])
-        default_k = int(self.config.get("num_experts_per_tok", 8))
+        default_k = int(self.config.get("num_experts_per_tok") or self.config.get("num_experts_per_token") or 8)
         self.top_k = max(1, min(self.num_experts, int(top_k or default_k)))
         self.enable_lookahead = bool(enable_lookahead)
         self.enable_merkle_kv = False
@@ -180,17 +193,36 @@ class DeimosMLXUniversalMoEEngine:
         cfg_for_mlx.setdefault("rope_scaling", None)
         cfg_for_mlx.setdefault("partial_rotary_factor", 1.0)
         cfg_for_mlx.setdefault("attention_chunk_size", cfg_for_mlx.get("attention_chunk_size") or 8192)
+        cfg_for_mlx.setdefault("model_max_length", cfg_for_mlx.get("max_position_embeddings", 32768))
+        cfg_for_mlx["tie_word_embeddings"] = False
+        if cfg_for_mlx.get("rotary_dim") and cfg_for_mlx.get("head_dim"):
+            cfg_for_mlx["rotary_dim"] = min(int(cfg_for_mlx["rotary_dim"]), int(cfg_for_mlx["head_dim"]))
+        if mtype == "kimi_linear" and "linear_attn_config" not in cfg_for_mlx:
+            ltypes = cfg_for_mlx.get("layer_types") or []
+            cfg_for_mlx["linear_attn_config"] = {
+                "num_heads": int(cfg_for_mlx.get("linear_num_heads", cfg_for_mlx["num_attention_heads"])),
+                "head_dim": int(cfg_for_mlx.get("linear_head_dim") or cfg_for_mlx.get("linear_head_k_dim", 128)),
+                "short_conv_kernel_size": int(cfg_for_mlx.get("linear_conv_kernel_dim", 4)),
+                "kda_layers": [i + 1 for i, t in enumerate(ltypes) if t != "full_attention"],
+            }
         if mtype in {"llama4_text", "llama4"}:
             from mlx_lm.models import llama4 as mlx_llama4
 
             m_args = mlx_llama4.ModelArgs(text_config=cfg_for_mlx, model_type="llama4")
             model: Any = mlx_llama4.Model(m_args)
+        elif mtype in {"minimax_m3_vl", "minimax_m3_vl_text"}:
+            from mlx_lm.models import minimax_m3_vl as mlx_mm3
+
+            m_args = mlx_mm3.ModelArgs.from_dict({"text_config": cfg_for_mlx, "model_type": "minimax_m3_vl"})
+            model = mlx_mm3.Model(m_args)
         else:
             model_cls, args_cls = mlx_get_classes(cfg_for_mlx)
             m_args = args_cls.from_dict(cfg_for_mlx)
             model = model_cls(m_args)
 
-        layers_seq = model.layers
+        lm_wrap = getattr(model, "language_model", model)
+        inner = getattr(lm_wrap, "model", lm_wrap)
+        layers_seq = getattr(model, "layers", getattr(lm_wrap, "layers", getattr(inner, "layers", None)))
         for a_idx, l_idx in enumerate(self.moe_layer_ids):
             if not _replace_layer_switch_glu(layers_seq[l_idx], a_idx, self.arena, self):
                 raise RuntimeError(f"Could not locate MLX SwitchGLU on layer {l_idx} (model_type={mtype!r}).")
@@ -198,8 +230,6 @@ class DeimosMLXUniversalMoEEngine:
         self._mmap_emb = DeimosMLXMmapEmbedding(
             self.store_dir / "embed_tokens.bin", self.vocab_size, self.hidden_size
         )
-        lm_wrap = getattr(model, "language_model", model)
-        inner = getattr(lm_wrap, "model", lm_wrap)
         if hasattr(inner, "embed_tokens"):
             inner.embed_tokens = self._mmap_emb
 
@@ -208,21 +238,54 @@ class DeimosMLXUniversalMoEEngine:
             self.store_dir / "lm_head_int8.bin",
             self.vocab_size, self.hidden_size, bits=lm_bits, group_size=64,
         )
+        self._mmap_emb.as_linear = self.lm_head  # type: ignore[attr-defined]
         if hasattr(lm_wrap, "lm_head"):
             lm_wrap.lm_head = self.lm_head
         if hasattr(model, "args") and hasattr(model.args, "tie_word_embeddings"):
             model.args.tie_word_embeddings = False
 
         raw_bb: Dict[str, mx.array] = mx.load(str(self.store_dir / "hf_backbone.safetensors"))
+        if mtype in {"minimax_m3_vl", "minimax_m3_vl_text"}:
+            moe_set = set(self.moe_layer_ids)
+            remapped: Dict[str, mx.array] = {}
+            for k, v in raw_bb.items():
+                nk = f"language_model.{k}" if k.startswith("model.") else k
+                for li in moe_set:
+                    nk = nk.replace(f".layers.{li}.mlp.", f".layers.{li}.block_sparse_moe.")
+                nk = nk.replace(".block_sparse_moe.gate.e_score_correction_bias", ".block_sparse_moe.e_score_correction_bias")
+                if nk.endswith(".gate_up_proj.weight") and ".shared_experts." not in nk:
+                    g_part, u_part = mx.split(v, 2, axis=0)
+                    stem = nk[: -len(".gate_up_proj.weight")]
+                    remapped[f"{stem}.gate_proj.weight"] = mx.contiguous(g_part)
+                    remapped[f"{stem}.up_proj.weight"] = mx.contiguous(u_part)
+                else:
+                    remapped[nk] = v
+            raw_bb = remapped
+        elif mtype == "kimi_linear":
+            remapped_k: Dict[str, mx.array] = {}
+            for k, v in raw_bb.items():
+                nk = k.replace(".self_attn.forget_gate.", ".self_attn.")
+                nk = nk.replace(".mlp.gate.e_score_correction_bias", ".mlp.e_score_correction_bias")
+                if nk.endswith(".self_attn.conv1d.weight") and int(v.shape[0]) % 3 == 0:
+                    kd = int(v.shape[0]) // 3
+                    stem = nk[: -len(".conv1d.weight")]
+                    remapped_k[f"{stem}.q_conv1d.weight"] = mx.contiguous(v[:kd])
+                    remapped_k[f"{stem}.k_conv1d.weight"] = mx.contiguous(v[kd : 2 * kd])
+                    remapped_k[f"{stem}.v_conv1d.weight"] = mx.contiguous(v[2 * kd :])
+                else:
+                    remapped_k[nk] = v
+            raw_bb = remapped_k
+
         if hasattr(model, "sanitize") and mtype not in {"llama4_text", "llama4"}:
             raw_bb = model.sanitize(raw_bb)
         clean_bb: Dict[str, mx.array] = {}
+        f32_keep = ("e_score_correction_bias", "expert_bias", "A_log", "dt_bias")
         for k, v in raw_bb.items():
             if k.startswith(("model.embed_tokens.", "embed_tokens.", "lm_head.", "language_model.lm_head.")):
                 continue
             if mtype in {"llama4_text", "llama4"} and k.startswith("model."):
                 k = f"language_model.{k}"
-            if v.dtype in (mx.float32, mx.bfloat16) and not k.endswith("e_score_correction_bias"):
+            if v.dtype in (mx.float32, mx.bfloat16) and not k.endswith(f32_keep):
                 v = v.astype(mx.float16)
             clean_bb[k] = v
         raw_bb.clear()
