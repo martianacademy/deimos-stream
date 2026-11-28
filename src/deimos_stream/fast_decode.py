@@ -109,7 +109,8 @@ def apply_q4_backbone(eng: Any, group_size: int = 64) -> None:
     for att in eng.attns:
         att.quantize_weights(group_size=group_size, bits=4)
     head = mx.dequantize(
-        eng.lm_head_qw, eng.lm_head_qs, eng.lm_head_qb, group_size=64, bits=eng.lm_head_bits
+        eng.lm_head_qw, eng.lm_head_qs, eng.lm_head_qb,
+        group_size=int(getattr(eng, "lm_head_group_size", 64)), bits=eng.lm_head_bits,
     )
     eng.lm_head_qw, eng.lm_head_qs, eng.lm_head_qb = mx.quantize(head, group_size=group_size, bits=4)
     mx.eval(eng.lm_head_qw, eng.lm_head_qs, eng.lm_head_qb)

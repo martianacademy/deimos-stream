@@ -295,6 +295,9 @@ class DeimosHFHybridMoEEngine:
             self.store_dir / "embed_tokens.bin", self.vocab_size, self.hidden_size, self.device, self.compute_dtype
         )
         inner_lm.embed_tokens = self._mmap_emb
+        # The lm_head stays INT8 for every backbone: the fused `__dp4a` INT8 GEMV is what the CUDA
+        # Graph head segment captures. `memory_budget.plan_slots` plans this INT8 size for hybrid
+        # stores on cuda/cpu, so keep the two in sync if this ever switches to `use_q4=True`.
         model.lm_head = DeimosInt8LMHead(
             self.store_dir / "lm_head_int8.bin", self.vocab_size, self.hidden_size,
             self.device, self.compute_dtype, use_q4=False,

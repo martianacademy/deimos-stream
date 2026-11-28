@@ -22,7 +22,7 @@ import numpy as np
 
 from deimos_stream.engine import HAS_MLX, DeimosPagedMoEEngine
 from deimos_stream.factory import create_paged_moe_engine
-from deimos_stream.fast_decode import iter_decode_tokens, supports_pipeline
+from deimos_stream.fast_decode import apply_q4_backbone, iter_decode_tokens, supports_pipeline
 from tests.test_merkle_and_arena import build_synthetic_moe_store, find_real_olmoe_store
 
 if HAS_MLX:
@@ -131,6 +131,25 @@ class TestFastDecode(unittest.TestCase):
             self.assertEqual(len(m["generated_ids"]), 7)
         finally:
             eng_cpu_q4.close()
+
+    def test_4b_q4_backbone_dequantizes_with_current_lm_head_group_size(self) -> None:
+        eng = self._eng()
+        try:
+            w = mx.dequantize(
+                eng.lm_head_qw, eng.lm_head_qs, eng.lm_head_qb,
+                group_size=eng.lm_head_group_size, bits=eng.lm_head_bits,
+            )
+            eng.lm_head_qw, eng.lm_head_qs, eng.lm_head_qb = mx.quantize(w, group_size=32, bits=8)
+            eng.lm_head_group_size = 32
+            w32 = mx.dequantize(eng.lm_head_qw, eng.lm_head_qs, eng.lm_head_qb, group_size=32, bits=8)
+            apply_q4_backbone(eng, group_size=64)
+            self.assertEqual((eng.lm_head_bits, eng.lm_head_group_size), (4, 64))
+            w4 = mx.dequantize(eng.lm_head_qw, eng.lm_head_qs, eng.lm_head_qb, group_size=64, bits=4)
+            a = np.asarray(w32.astype(mx.float32)).ravel()
+            b = np.asarray(w4.astype(mx.float32)).ravel()
+            self.assertGreater(float(np.corrcoef(a, b)[0, 1]), 0.98)
+        finally:
+            eng.close()
 
     def test_5_sampling_path_runs(self) -> None:
         eng = self._eng()
