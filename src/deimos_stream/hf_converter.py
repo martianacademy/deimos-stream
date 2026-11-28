@@ -313,7 +313,13 @@ def convert_hf_hybrid_moe_to_deimos(
         "model.embed_tokens.weight",
         "embed.weight",
     )
-    emb_key = next(k for k in emb_cands if k in active_keys)
+    emb_key = next((k for k in emb_cands if k in active_keys), None)
+    if emb_key is None:
+        sample = sorted(active_keys)[:20]
+        raise ValueError(
+            f"No token embedding tensor found in {repo_id_or_dir!r}: tried {list(dict.fromkeys(emb_cands))}; "
+            f"{len(active_keys)} available keys, first {len(sample)}: {sample}"
+        )
     emb_t = pop_tensor_dequant(fetcher, emb_key, active_keys, used_special, device="cpu").to(torch.float16).contiguous()
     emb_bytes = emb_t.numpy().tobytes()
     (out_dir / "embed_tokens.bin").write_bytes(emb_bytes)

@@ -103,7 +103,20 @@ class TestMemoryBudget(unittest.TestCase):
         ph = plan_slots(
             h, "cuda", available_bytes=40 * MIB, memory_fraction=1.0, reserve_bytes=0, backbone="q4"
         )
-        self.assertEqual(ph.fixed_bytes, int(10 * MIB * 7.5 / 16) + int(2 * MIB * 4.5 / 8))
+        # The PyTorch HF-hybrid engine (cuda/cpu) keeps its fused INT8 lm_head under --backbone q4,
+        # so the planner must not shrink it there (under-planning VRAM otherwise).
+        self.assertEqual(ph.fixed_bytes, int(10 * MIB * 7.5 / 16) + 2 * MIB)
+        # MLX hybrid engines quantize the lm_head to Q4, and an explicit override is honoured.
+        q4_head = int(10 * MIB * 7.5 / 16) + int(2 * MIB * 4.5 / 8)
+        pm = plan_slots(
+            h, "mlx", available_bytes=40 * MIB, memory_fraction=1.0, reserve_bytes=0, backbone="q4"
+        )
+        self.assertEqual(pm.fixed_bytes, q4_head)
+        po = plan_slots(
+            h, "cuda", available_bytes=40 * MIB, memory_fraction=1.0, reserve_bytes=0, backbone="q4",
+            lm_head_q4=True,
+        )
+        self.assertEqual(po.fixed_bytes, q4_head)
 
     def test_6c_cuda_ring_buffer_not_throttled_by_host_ram(self) -> None:
         # CUDA TorchPagedExpertArena uses a fixed 32-slot (~58 MB) ring buffer instead of a full

@@ -390,12 +390,16 @@ class DeimosPagedMoEEngine:
         ttft_ms = (time.perf_counter() - t_pf) * 1000.0
 
         self.arena.reset_telemetry()
+        # The first token is already chosen (it is counted in TTFT). `iter_decode_tokens` yields it
+        # again from the same prefill logits without a forward pass, then runs one forward pass per
+        # further token, so the timed window covers exactly `len(gen_ids) - 1` decoded tokens.
         t_dec = time.perf_counter()
         gen_ids = list(
             iter_decode_tokens(self, logits, caches, max_new_tokens + 1, prompt_ids=prompt_ids)
         )
         decode_sec = max(1e-6, time.perf_counter() - t_dec)
         self.arena.wait_idle()
+        n_decoded = max(0, len(gen_ids) - 1)
 
         act_mb, peak_mb = mlx_mem_mb()
         st: ArenaStats = self.arena.get_stats(nominal_top_k=self.top_k)
@@ -411,7 +415,7 @@ class DeimosPagedMoEEngine:
             "pool_vram_mb": st["pool_vram_mb"],
             "kv_skipped_tokens": skipped,
             "ttft_ms": round(ttft_ms, 2),
-            "decode_tok_per_s": round(max_new_tokens / decode_sec, 2),
+            "decode_tok_per_s": round(n_decoded / decode_sec, 2),
             "hit_rate_pct": st["hit_rate_pct"],
             "cache_hits": st["cache_hits"],
             "cache_misses": st["cache_misses"],

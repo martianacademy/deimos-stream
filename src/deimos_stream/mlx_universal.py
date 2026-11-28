@@ -89,6 +89,11 @@ class DeimosMLXSwitchGLU(_NNModule):  # type: ignore[misc,valid-type]
         for s0 in range(0, N, max_c):
             s1 = min(N, s0 + max_c)
             sc_slice = ones_sc if (s1 - s0) == ones_sc.shape[0] else np.ones((s1 - s0, K), dtype=np.float32)
+            # `miss_tail_tau` stays 1.0 here on purpose. This `SwitchGLU` only sees expert indices (the
+            # mlx_lm block applies the routing scores to our `[..., K, D]` output afterwards), so the
+            # native tail filter would rank all-ones scores and return fewer, re-ordered columns that
+            # no longer line up with `indices`. `self.engine_ref.miss_tail_tau` is therefore not used
+            # by this engine (the CLI default 0.85 is accepted and ignored here).
             phys_np, _ = self.arena.resolve_and_prefetch(
                 a_i, ind_np[s0:s1], sc_slice, miss_tail_tau=1.0
             )

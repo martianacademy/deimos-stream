@@ -27,15 +27,26 @@ from deimos_stream.hf_converter import convert_hf_hybrid_moe_to_deimos
 from deimos_stream.model_adapters import validate_convertible_architecture
 from deimos_stream.torch_arena import HAS_TORCH
 
+HAS_HF = False
 if HAS_TORCH:
-    from safetensors.torch import save_file as st_save_torch
     import torch
-    from transformers import (
-        AutoModelForCausalLM,
-        DeepseekV3Config,
-        Glm4MoeConfig,
-        Llama4TextConfig,
-    )
+
+    try:
+        from safetensors.torch import save_file as st_save_torch
+        from transformers import (
+            AutoModelForCausalLM,
+            DeepseekV3Config,
+            Glm4MoeConfig,
+            Llama4TextConfig,
+        )
+
+        HAS_HF = True
+    except ImportError:  # torch without safetensors / a transformers that lacks these configs
+        HAS_HF = False
+
+requires_hf = pytest.mark.skipif(
+    not (HAS_TORCH and HAS_HF), reason="PyTorch, safetensors & transformers required"
+)
 
 
 def _pearson_r(a: np.ndarray, b: np.ndarray) -> float:
@@ -94,7 +105,7 @@ def _save_split_experts_checkpoint(
     st_save_torch(flat_sd, str(ckpt_dir / "model.safetensors"))
 
 
-@pytest.mark.skipif(not HAS_TORCH, reason="PyTorch & transformers required")
+@requires_hf
 def test_deepseek_v3_fp8_mla_mixed_layers_parity(tmp_path: Path) -> None:
     torch.manual_seed(7)
     cfg = DeepseekV3Config(
@@ -163,7 +174,7 @@ def test_deepseek_v3_fp8_mla_mixed_layers_parity(tmp_path: Path) -> None:
             eng_mlx.close()
 
 
-@pytest.mark.skipif(not HAS_TORCH, reason="PyTorch & transformers required")
+@requires_hf
 def test_glm4_moe_mixed_layers_parity(tmp_path: Path) -> None:
     torch.manual_seed(11)
     cfg = Glm4MoeConfig(
@@ -220,7 +231,7 @@ def test_glm4_moe_mixed_layers_parity(tmp_path: Path) -> None:
             eng_mlx.close()
 
 
-@pytest.mark.skipif(not HAS_TORCH, reason="PyTorch & transformers required")
+@requires_hf
 def test_llama4_interleaved_transposed_3d_experts_parity(tmp_path: Path) -> None:
     torch.manual_seed(23)
     cfg = Llama4TextConfig(
@@ -275,6 +286,33 @@ def test_llama4_interleaved_transposed_3d_experts_parity(tmp_path: Path) -> None
             assert len(bm_mlx["generated_ids"]) == 4
         finally:
             eng_mlx.close()
+
+
+@pytest.mark.skipif(not HAS_TORCH, reason="PyTorch required by the converter")
+def test_converter_missing_embedding_raises_descriptive_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import deimos_stream.hf_converter as hc
+
+    cfg = {
+        "model_type": "qwen3_moe", "architectures": ["Qwen3MoeForCausalLM"], "num_hidden_layers": 1,
+        "hidden_size": 64, "moe_intermediate_size": 32, "num_experts": 2, "num_experts_per_tok": 1,
+        "vocab_size": 128,
+    }
+    weight_map = {
+        f"model.layers.0.mlp.experts.{e}.{p}_proj.weight": "model.safetensors"
+        for e in range(2)
+        for p in ("gate", "up", "down")
+    }
+    weight_map["model.layers.0.mlp.gate.weight"] = "model.safetensors"
+    monkeypatch.setattr(hc, "_fetch_metadata_files", lambda *a, **k: (cfg, weight_map, 0))
+    monkeypatch.setattr(hc, "compile_deimos_dylib", lambda force=False: None)
+    with pytest.raises(ValueError) as exc:
+        hc.convert_hf_hybrid_moe_to_deimos("fake/no-embeddings", tmp_path / "out")
+    msg = str(exc.value)
+    assert "No token embedding tensor" in msg
+    assert "model.embed_tokens.weight" in msg and "embed.weight" in msg
+    assert "model.layers.0.mlp.gate.weight" in msg
 
 
 def test_roadmap_validation_and_models_cli(capsys: pytest.CaptureFixture[str]) -> None:
